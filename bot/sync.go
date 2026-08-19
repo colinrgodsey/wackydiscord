@@ -131,16 +131,38 @@ func FormatToolTurnSummary(turn *genai.Content) string {
 			continue
 		}
 		if p.FunctionCall != nil {
-			argsBytes, _ := json.Marshal(p.FunctionCall.Args)
-			sb.WriteString(fmt.Sprintf("🔧 **Tool Call:** `%s`\n```json\n%s\n```\n", p.FunctionCall.Name, string(argsBytes)))
+			argsBytes, err := json.MarshalIndent(p.FunctionCall.Args, "", "  ")
+			if err != nil {
+				argsBytes, _ = json.Marshal(p.FunctionCall.Args)
+			}
+			argsStr := string(argsBytes)
+			if len(argsStr) > 1200 {
+				argsStr = argsStr[:1200] + "\n... (truncated)"
+			}
+			sb.WriteString(fmt.Sprintf("🔧 **Tool Call:** `%s`\n```json\n%s\n```\n", p.FunctionCall.Name, argsStr))
 		}
 		if p.FunctionResponse != nil {
-			respBytes, _ := json.Marshal(p.FunctionResponse.Response)
-			summary := string(respBytes)
-			if len(summary) > 400 {
-				summary = summary[:400] + "... (truncated)"
+			if p.FunctionResponse.Response != nil {
+				if outStr, ok := p.FunctionResponse.Response["output"].(string); ok && outStr != "" {
+					summary := strings.TrimSpace(outStr)
+					if len(summary) > 1200 {
+						summary = summary[:1200] + "\n... (truncated)"
+					}
+					sb.WriteString(fmt.Sprintf("⚡ **Tool Output:** `%s`\n```\n%s\n```\n", p.FunctionResponse.Name, summary))
+				} else {
+					respBytes, err := json.MarshalIndent(p.FunctionResponse.Response, "", "  ")
+					if err != nil {
+						respBytes, _ = json.Marshal(p.FunctionResponse.Response)
+					}
+					summary := string(respBytes)
+					if len(summary) > 1200 {
+						summary = summary[:1200] + "\n... (truncated)"
+					}
+					sb.WriteString(fmt.Sprintf("⚡ **Tool Response:** `%s`\n```json\n%s\n```\n", p.FunctionResponse.Name, summary))
+				}
+			} else {
+				sb.WriteString(fmt.Sprintf("⚡ **Tool Response:** `%s`\n", p.FunctionResponse.Name))
 			}
-			sb.WriteString(fmt.Sprintf("⚡ **Tool Response:** `%s`\n```json\n%s\n```\n", p.FunctionResponse.Name, summary))
 		}
 	}
 

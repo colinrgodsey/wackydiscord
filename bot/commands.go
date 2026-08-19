@@ -290,20 +290,26 @@ func (b *Bot) handleFillCommand(s *discordgo.Session, i *discordgo.InteractionCr
 
 	for _, turn := range unsynced {
 		if turn.Role == "user" {
-			text := FormatUserBackfillMessage(turn)
-			if text != "" {
-				_ = SendAgentMessage(s, i.ChannelID, "User", text, nil)
-			}
-		} else {
-			text := FormatAssistantBackfillMessage(turn)
-			if text != "" {
-				_ = SendAgentMessage(s, i.ChannelID, binding.AgentID, text, wh)
-			}
 			if binding.Verbose {
 				toolText := FormatToolTurnSummary(turn)
 				if toolText != "" {
 					_ = SendAgentMessage(s, i.ChannelID, "Tools", toolText, nil)
 				}
+			}
+			text := FormatUserBackfillMessage(turn)
+			if text != "" {
+				_ = SendAgentMessage(s, i.ChannelID, "User", text, nil)
+			}
+		} else {
+			if binding.Verbose {
+				toolText := FormatToolTurnSummary(turn)
+				if toolText != "" {
+					_ = SendAgentMessage(s, i.ChannelID, "Tools", toolText, nil)
+				}
+			}
+			text := FormatAssistantBackfillMessage(turn)
+			if text != "" {
+				_ = SendAgentMessage(s, i.ChannelID, binding.AgentID, text, wh)
 			}
 		}
 	}

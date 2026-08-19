@@ -59,6 +59,10 @@ func NewBot(cfg Config) (*Bot, error) {
 		statePath = filepath.Join(absWsDir, DefaultStateFileName)
 	}
 
+	// Ensure clean call chain state on startup (D59)
+	_ = os.Unsetenv(agent.Agent2AgentEnvVar)
+	_ = os.Unsetenv(agent.CallChainEnvVar)
+
 	st, err := NewState(statePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize state: %w", err)

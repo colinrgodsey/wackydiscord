@@ -98,14 +98,28 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 
 	// 4. Generate agent turn under session lock
 	ctx := context.Background()
+	initialTurns, _ := b.SDK.ReadSession(binding.AgentID)
+	startIdx := len(initialTurns)
+
 	respText, err := b.SDK.AddAndGenerateTurn(ctx, binding.AgentID, userText)
 	close(stopTyping)
 
-	// 5. Update sync marker to newly generated turn FIRST before sending message
-	turns, _ := b.SDK.ReadSession(binding.AgentID)
-	if len(turns) > 0 {
-		binding.LastTurnIndex = len(turns) - 1
-		binding.LastTurnHash = ComputeTurnHash(turns[binding.LastTurnIndex])
+	// 5. Read newly generated turns, emit verbose tool logs if enabled, and update sync marker
+	allTurns, _ := b.SDK.ReadSession(binding.AgentID)
+	if len(allTurns) > 0 {
+		if binding.Verbose && len(allTurns) > startIdx+1 {
+			// allTurns[startIdx] is the newly appended user message.
+			// allTurns[startIdx+1 : len(allTurns)-1] are intermediate tool calls and responses.
+			for _, turn := range allTurns[startIdx+1:] {
+				toolText := FormatToolTurnSummary(turn)
+				if toolText != "" {
+					_ = SendAgentMessage(s, m.ChannelID, "Tools", toolText, nil)
+				}
+			}
+		}
+
+		binding.LastTurnIndex = len(allTurns) - 1
+		binding.LastTurnHash = ComputeTurnHash(allTurns[binding.LastTurnIndex])
 		binding.PendingUserHash = ""
 		binding.PendingUserText = ""
 		binding.IsGenerating = false
@@ -163,20 +177,29 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 				binding.PendingUserText = ""
 				continue
 			}
-			text := FormatUserBackfillMessage(turn)
-			if text != "" {
-				_ = SendAgentMessage(s, channelID, "User", text, nil)
-			}
-		} else {
-			text := FormatAssistantBackfillMessage(turn)
-			if text != "" {
-				_ = SendAgentMessage(s, channelID, binding.AgentID, text, wh)
-			}
+
 			if binding.Verbose {
 				toolText := FormatToolTurnSummary(turn)
 				if toolText != "" {
 					_ = SendAgentMessage(s, channelID, "Tools", toolText, nil)
 				}
+			}
+
+			text := FormatUserBackfillMessage(turn)
+			if text != "" {
+				_ = SendAgentMessage(s, channelID, "User", text, nil)
+			}
+		} else {
+			if binding.Verbose {
+				toolText := FormatToolTurnSummary(turn)
+				if toolText != "" {
+					_ = SendAgentMessage(s, channelID, "Tools", toolText, nil)
+				}
+			}
+
+			text := FormatAssistantBackfillMessage(turn)
+			if text != "" {
+				_ = SendAgentMessage(s, channelID, binding.AgentID, text, wh)
 			}
 		}
 	}

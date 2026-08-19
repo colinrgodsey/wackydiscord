@@ -286,26 +286,49 @@ func TestFormattingHelpers(t *testing.T) {
 	})
 
 	t.Run("FormatToolTurnSummary", func(t *testing.T) {
-		turn := &genai.Content{
+		// Model turn with FunctionCall
+		callTurn := &genai.Content{
 			Role: "model",
 			Parts: []*genai.Part{
 				{
 					FunctionCall: &genai.FunctionCall{
 						Name: "run_command",
-						Args: map[string]any{"cmd": "ls"},
-					},
-				},
-				{
-					FunctionResponse: &genai.FunctionResponse{
-						Name:     "run_command",
-						Response: map[string]any{"stdout": "file.txt"},
+						Args: map[string]any{"command": "files-rw", "args": []any{"list", "."}},
 					},
 				},
 			},
 		}
-		summary := FormatToolTurnSummary(turn)
-		if !strings.Contains(summary, "Tool Call:** `run_command`") || !strings.Contains(summary, "Tool Response:** `run_command`") {
-			t.Errorf("unexpected tool turn summary: %s", summary)
+		callSummary := FormatToolTurnSummary(callTurn)
+		if !strings.Contains(callSummary, "🔧 **Tool Call:** `run_command`") || !strings.Contains(callSummary, `"command": "files-rw"`) {
+			t.Errorf("unexpected tool call summary: %s", callSummary)
+		}
+
+		// User turn with FunctionResponse and output field
+		respTurn := &genai.Content{
+			Role: "user",
+			Parts: []*genai.Part{
+				{
+					FunctionResponse: &genai.FunctionResponse{
+						Name:     "run_command",
+						Response: map[string]any{"output": "<STDOUT>file1.txt\nfile2.txt</STDOUT>"},
+					},
+				},
+			},
+		}
+		respSummary := FormatToolTurnSummary(respTurn)
+		if !strings.Contains(respSummary, "⚡ **Tool Output:** `run_command`") || !strings.Contains(respSummary, "file1.txt") {
+			t.Errorf("unexpected tool response summary: %s", respSummary)
+		}
+
+		// Plain user text turn returns empty
+		userTurn := &genai.Content{
+			Role: "user",
+			Parts: []*genai.Part{
+				{Text: "just a text message"},
+			},
+		}
+		if s := FormatToolTurnSummary(userTurn); s != "" {
+			t.Errorf("expected empty tool summary for plain text turn, got %q", s)
 		}
 	})
 }
