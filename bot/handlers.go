@@ -143,7 +143,8 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 	}
 
 	if strings.TrimSpace(respText) != "" {
-		_ = SendAgentMessage(s, m.ChannelID, binding.AgentID, respText, wh)
+		expandedText := ExpandScratchpadSentinels(b.SDK, binding.AgentID, respText)
+		_ = SendAgentMessage(s, m.ChannelID, binding.AgentID, expandedText, wh)
 	}
 }
 
@@ -199,6 +200,7 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 
 			text := FormatAssistantBackfillMessage(turn)
 			if text != "" {
+				text = ExpandScratchpadSentinels(b.SDK, binding.AgentID, text)
 				_ = SendAgentMessage(s, channelID, binding.AgentID, text, wh)
 			}
 		}

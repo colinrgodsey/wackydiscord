@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/colinrgodsey/wackypub/pkg/agent"
@@ -167,4 +168,33 @@ func FormatToolTurnSummary(turn *genai.Content) string {
 	}
 
 	return strings.TrimSpace(sb.String())
+}
+
+var (
+	scratchpadExpandRegex = regexp.MustCompile(`(?i)<SCRATCHPAD_EXPAND\s+([^>]+)\s*/?>`)
+	expandIDRegex         = regexp.MustCompile(`(?i)id=\\?["']([^"'\\\s]+)["']\\?`)
+)
+
+// ExpandScratchpadSentinels scans message text for <SCRATCHPAD_EXPAND id="X" /> sentinels (D61)
+// and substitutes the referenced scratchpad text inline via sdk.GetScratchpad.
+// If resolution fails (e.g. entry missing or evicted), the tag is left untouched (graceful fallback).
+func ExpandScratchpadSentinels(sdk *agent.AgentSDK, agentID string, text string) string {
+	if sdk == nil || agentID == "" || (!strings.Contains(text, "<SCRATCHPAD_EXPAND") && !strings.Contains(text, "<scratchpad_expand")) {
+		return text
+	}
+
+	return scratchpadExpandRegex.ReplaceAllStringFunc(text, func(match string) string {
+		idMatch := expandIDRegex.FindStringSubmatch(match)
+		if len(idMatch) < 2 {
+			return match
+		}
+		id := idMatch[1]
+
+		content, err := sdk.GetScratchpad(agentID, id, nil, nil)
+		if err != nil || content == "" {
+			return match
+		}
+
+		return content
+	})
 }

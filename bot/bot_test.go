@@ -1,12 +1,14 @@
 package bot
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/colinrgodsey/wackypub/pkg/agent"
 	"google.golang.org/genai"
 )
 
@@ -329,6 +331,67 @@ func TestFormattingHelpers(t *testing.T) {
 		}
 		if s := FormatToolTurnSummary(userTurn); s != "" {
 			t.Errorf("expected empty tool summary for plain text turn, got %q", s)
+		}
+	})
+
+	t.Run("ExpandScratchpadSentinels", func(t *testing.T) {
+		wsDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(wsDir, agent.RootMarkerFile), []byte(""), 0644); err != nil {
+			t.Fatalf("failed writing root marker: %v", err)
+		}
+		bobDir := filepath.Join(wsDir, "bob")
+		if err := os.MkdirAll(bobDir, 0755); err != nil {
+			t.Fatalf("failed creating bobDir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(bobDir, "AGENTS.md"), []byte("Prompt"), 0644); err != nil {
+			t.Fatalf("failed writing AGENTS.md: %v", err)
+		}
+
+		origCwd, _ := os.Getwd()
+		if err := os.Chdir(wsDir); err != nil {
+			t.Fatalf("failed to chdir to wsDir: %v", err)
+		}
+		defer os.Chdir(origCwd)
+
+		sdk := agent.NewSDK(wsDir)
+
+		// Create scratchpad entries
+		entry1, err := sdk.CreateScratchpad("bob", "The rain fell heavily across Neo-Tokyo.", "test")
+		if err != nil {
+			t.Fatalf("CreateScratchpad failed: %v", err)
+		}
+		entry2, err := sdk.CreateScratchpad("bob", "A shadow stepped out from the alley.", "test")
+		if err != nil {
+			t.Fatalf("CreateScratchpad failed: %v", err)
+		}
+
+		// 1. Single sentinel expansion
+		rawText1 := fmt.Sprintf("Prologue:\n<SCRATCHPAD_EXPAND id=%q />", entry1.ID)
+		expanded1 := ExpandScratchpadSentinels(sdk, "bob", rawText1)
+		expected1 := fmt.Sprintf("Prologue:\n%s", "The rain fell heavily across Neo-Tokyo.")
+		if expanded1 != expected1 {
+			t.Errorf("expected %q, got %q", expected1, expanded1)
+		}
+
+		// 2. Multiple sentinels with mixed case and quote styles
+		rawText2 := fmt.Sprintf("Chapter 1:\n<SCRATCHPAD_EXPAND id=%q/>\nChapter 2:\n<scratchpad_expand id='%s' />", entry1.ID, entry2.ID)
+		expanded2 := ExpandScratchpadSentinels(sdk, "bob", rawText2)
+		expected2 := "Chapter 1:\nThe rain fell heavily across Neo-Tokyo.\nChapter 2:\nA shadow stepped out from the alley."
+		if expanded2 != expected2 {
+			t.Errorf("expected %q, got %q", expected2, expanded2)
+		}
+
+		// 3. Graceful fallback on missing/invalid ID
+		rawText3 := "Unknown entry: <SCRATCHPAD_EXPAND id=\"nonexistent\" />"
+		expanded3 := ExpandScratchpadSentinels(sdk, "bob", rawText3)
+		if expanded3 != rawText3 {
+			t.Errorf("expected missing ID to remain unexpanded %q, got %q", rawText3, expanded3)
+		}
+
+		// 4. Pass-through for text without sentinels
+		plainText := "Just a normal conversational turn."
+		if s := ExpandScratchpadSentinels(sdk, "bob", plainText); s != plainText {
+			t.Errorf("expected unchanged text, got %q", s)
 		}
 	})
 }

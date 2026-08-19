@@ -309,6 +309,7 @@ func (b *Bot) handleFillCommand(s *discordgo.Session, i *discordgo.InteractionCr
 			}
 			text := FormatAssistantBackfillMessage(turn)
 			if text != "" {
+				text = ExpandScratchpadSentinels(b.SDK, binding.AgentID, text)
 				_ = SendAgentMessage(s, i.ChannelID, binding.AgentID, text, wh)
 			}
 		}
