@@ -272,7 +272,12 @@ func (b *Bot) handleFillCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 
 	unsynced, newIdx, newHash := DiffUnsyncedTurns(turns, binding.LastTurnHash, binding.LastTurnIndex)
-	if limit > 0 && len(unsynced) > limit {
+	if limit > 0 && len(unsynced) == 0 && len(turns) > 0 {
+		if limit > len(turns) {
+			limit = len(turns)
+		}
+		unsynced = turns[len(turns)-limit:]
+	} else if limit > 0 && len(unsynced) > limit {
 		unsynced = unsynced[len(unsynced)-limit:]
 	}
 

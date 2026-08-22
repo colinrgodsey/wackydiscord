@@ -16,8 +16,8 @@ import (
 
 // HandleMessageCreate processes regular messages sent to bound Discord channels.
 func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
-	// Ignore bot messages to prevent infinite reply loops
-	if m.Author == nil || m.Author.Bot {
+	// Ignore bot messages and webhook messages to prevent infinite reply loops
+	if m.Author == nil || m.Author.Bot || m.WebhookID != "" {
 		return
 	}
 

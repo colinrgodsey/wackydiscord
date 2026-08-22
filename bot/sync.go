@@ -76,9 +76,9 @@ func DiffUnsyncedTurns(turns []*genai.Content, lastHash string, lastIndex int) (
 		return nil, newLastIdx, newLastHash
 	}
 
-	// Case 4: Hash not found (compaction truncated history past the last synced turn)
-	// Return all surviving turns to preserve continuity
-	return turns, newLastIdx, newLastHash
+	// Case 4: Hash not found (session was truncated/pruned from the end, or completely reset).
+	// Do NOT replay historical prefix turns into the channel; simply update the sync markers.
+	return nil, newLastIdx, newLastHash
 }
 
 // FormatUserBackfillMessage formats an unsynced background user turn with clear blockquotes and attribution.

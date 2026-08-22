@@ -235,15 +235,17 @@ func TestDiffUnsyncedTurns(t *testing.T) {
 		}
 	})
 
-	t.Run("compaction pruned past last synced turn (hash not found)", func(t *testing.T) {
-		// Suppose compaction pruned turn0, turn1, turn2, so only [turn3] remains
-		compactedTurns := []*genai.Content{turn3}
-		unsynced, idx, hash := DiffUnsyncedTurns(compactedTurns, h1, 1)
-		if len(unsynced) != 1 || unsynced[0] != turn3 {
-			t.Fatalf("expected all surviving turns to be returned, got %d", len(unsynced))
+	t.Run("pruned turns from end (hash not found / session shrank)", func(t *testing.T) {
+		// Suppose turns were [turn0, turn1, turn2, turn3] and last synced was turn3 (idx 3, h3).
+		// Now user pruned turn3 and turn2, so only [turn0, turn1] remains.
+		prunedTurns := []*genai.Content{turn0, turn1}
+		unsynced, idx, hash := DiffUnsyncedTurns(prunedTurns, h3, 3)
+		// Must NOT replay turn0 or turn1! Must return 0 unsynced turns and update marker to turn1 (idx 1).
+		if len(unsynced) != 0 {
+			t.Fatalf("expected 0 unsynced turns on pruned session, got %d", len(unsynced))
 		}
-		if idx != 0 || hash != h3 {
-			t.Errorf("expected idx=0 hash=%s, got idx=%d hash=%s", h3, idx, hash)
+		if idx != 1 || hash != h1 {
+			t.Errorf("expected idx=1 hash=%s, got idx=%d hash=%s", h1, idx, hash)
 		}
 	})
 
