@@ -96,12 +96,32 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		}
 	}()
 
-	// 4. Generate agent turn under session lock
+	// 4. Ensure Webhook is available for persona delivery
+	var wh *discordgo.Webhook
+	if binding.WebhookID != "" && binding.WebhookToken != "" {
+		wh = &discordgo.Webhook{ID: binding.WebhookID, Token: binding.WebhookToken}
+	} else if newWH, err := EnsureWebhook(s, m.ChannelID); err == nil && newWH != nil {
+		wh = newWH
+		binding.WebhookID = newWH.ID
+		binding.WebhookToken = newWH.Token
+		_ = b.State.SetBinding(binding)
+	}
+
 	ctx := context.Background()
 	initialTurns, _ := b.SDK.ReadSession(binding.AgentID)
 	startIdx := len(initialTurns)
 
-	respText, err := b.SDK.AddAndGenerateTurn(ctx, binding.AgentID, userText)
+	var streamErr error
+	for chunk, err := range b.SDK.AddAndGenerateTurnStream(ctx, binding.AgentID, userText) {
+		if err != nil {
+			streamErr = err
+			break
+		}
+		if strings.TrimSpace(chunk) != "" {
+			expandedText := ExpandScratchpadSentinels(b.SDK, binding.AgentID, chunk)
+			_ = SendAgentMessage(s, m.ChannelID, binding.AgentID, expandedText, wh)
+		}
+	}
 	close(stopTyping)
 
 	// 5. Read newly generated turns, emit verbose tool logs if enabled, and update sync marker
@@ -126,25 +146,9 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		_ = b.State.SetBinding(binding)
 	}
 
-	// 6. Send assistant response
-	var wh *discordgo.Webhook
-	if binding.WebhookID != "" && binding.WebhookToken != "" {
-		wh = &discordgo.Webhook{ID: binding.WebhookID, Token: binding.WebhookToken}
-	} else if newWH, err := EnsureWebhook(s, m.ChannelID); err == nil && newWH != nil {
-		wh = newWH
-		binding.WebhookID = newWH.ID
-		binding.WebhookToken = newWH.Token
-		_ = b.State.SetBinding(binding)
-	}
-
-	if err != nil {
-		_ = SendAgentMessage(s, m.ChannelID, "System", fmt.Sprintf("❌ **Agent error:** %v", err), nil)
+	if streamErr != nil {
+		_ = SendAgentMessage(s, m.ChannelID, "System", fmt.Sprintf("❌ **Agent error:** %v", streamErr), nil)
 		return
-	}
-
-	if strings.TrimSpace(respText) != "" {
-		expandedText := ExpandScratchpadSentinels(b.SDK, binding.AgentID, respText)
-		_ = SendAgentMessage(s, m.ChannelID, binding.AgentID, expandedText, wh)
 	}
 }
 
