@@ -7,7 +7,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/bwmarrin/discordgo"
 	"github.com/colinrgodsey/wackypub/pkg/agent"
 	"google.golang.org/genai"
 )
@@ -141,6 +143,59 @@ func TestStatePersistenceAndConcurrency(t *testing.T) {
 	}
 	if st.GetBinding("chan_100") != nil {
 		t.Errorf("expected chan_100 to be removed")
+	}
+}
+
+func TestState_LockChannel(t *testing.T) {
+	st, err := NewState(filepath.Join(t.TempDir(), ".wackydiscord.json"))
+	if err != nil {
+		t.Fatalf("NewState failed: %v", err)
+	}
+
+	// 1. Lazy creation & unlock execution
+	unlock1 := st.LockChannel("chan_a")
+	if unlock1 == nil {
+		t.Fatal("expected non-nil unlock function")
+	}
+	unlock1()
+
+	// 2. Different channels get independent locks and can be acquired concurrently
+	unlockA := st.LockChannel("chan_a")
+	unlockB := st.LockChannel("chan_b")
+
+	// Both chan_a and chan_b held simultaneously without deadlock
+	unlockA()
+	unlockB()
+
+	// 3. Same channel blocks until unlocked
+	locked := make(chan struct{})
+	unlocked := make(chan struct{})
+	done := make(chan struct{})
+
+	unlockMain := st.LockChannel("chan_c")
+	go func() {
+		close(locked)
+		unlockSecond := st.LockChannel("chan_c")
+		close(unlocked)
+		unlockSecond()
+		close(done)
+	}()
+
+	<-locked
+	select {
+	case <-unlocked:
+		t.Fatal("second LockChannel should have blocked while chan_c was held")
+	case <-time.After(50 * time.Millisecond):
+		// Expected to still be blocked
+	}
+
+	unlockMain()
+
+	select {
+	case <-done:
+		// Succeeded
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for second LockChannel to acquire lock after unlock")
 	}
 }
 
@@ -560,5 +615,473 @@ func TestValidateBindings(t *testing.T) {
 	}
 	if !foundInvalid {
 		t.Errorf("expected warning for invalid runtime.json bob, got: %v", warnings)
+	}
+}
+
+func TestHandleMessageCreate_UnbindingRaceAndNilCheck(t *testing.T) {
+	tmpDir := t.TempDir()
+	markerPath := filepath.Join(tmpDir, "WACKYPUB_ROOT")
+	if err := os.WriteFile(markerPath, []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write WACKYPUB_ROOT: %v", err)
+	}
+
+	bobDir := filepath.Join(tmpDir, "bob")
+	if err := os.MkdirAll(bobDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bobDir, "AGENTS.md"), []byte("Prompt"), 0644); err != nil {
+		t.Fatalf("failed writing AGENTS.md: %v", err)
+	}
+
+	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
+	st, err := NewState(stateFile)
+	if err != nil {
+		t.Fatalf("NewState failed: %v", err)
+	}
+
+	b := &Bot{
+		WsDir: tmpDir,
+		State: st,
+		SDK:   agent.NewSDK(tmpDir),
+	}
+
+	// 1. Unbound channel -> fast pre-lock check returns cleanly
+	b.HandleMessageCreate(nil, &discordgo.MessageCreate{
+		Message: &discordgo.Message{
+			ChannelID: "unbound_chan",
+			Content:   "hello",
+			Author:    &discordgo.User{ID: "user1", Bot: false},
+		},
+	})
+
+	// 2. Bound channel: hold channel lock, launch HandleMessageCreate on background goroutine.
+	// It passes the pre-lock check (binding exists), then blocks on LockChannel.
+	// Remove the binding while it's blocked, then release the lock.
+	// Assert it unblocks, sees nil binding post-lock, and exits cleanly without panicking or recreating the binding.
+	_ = st.SetBinding(&ChannelBinding{
+		ChannelID: "chan_race",
+		AgentID:   "bob",
+	})
+
+	unlock := st.LockChannel("chan_race")
+	done := make(chan struct{})
+
+	go func() {
+		b.HandleMessageCreate(nil, &discordgo.MessageCreate{
+			Message: &discordgo.Message{
+				ChannelID: "chan_race",
+				Content:   "hello",
+				Author:    &discordgo.User{ID: "user1", Bot: false},
+			},
+		})
+		close(done)
+	}()
+
+	// Ensure HandleMessageCreate has started and is blocked on LockChannel
+	select {
+	case <-done:
+		t.Fatal("HandleMessageCreate should have blocked while channel lock was held")
+	case <-time.After(50 * time.Millisecond):
+		// Expected to be blocked
+	}
+
+	// Remove binding while HandleMessageCreate is waiting on the lock
+	if err := st.RemoveBinding("chan_race"); err != nil {
+		t.Fatalf("RemoveBinding failed: %v", err)
+	}
+
+	// Release channel lock
+	unlock()
+
+	select {
+	case <-done:
+		// Succeeded
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for HandleMessageCreate to return after unbinding")
+	}
+
+	// Confirm channel remains unbound (no resurrection write)
+	if remaining := st.GetBinding("chan_race"); remaining != nil {
+		t.Errorf("expected chan_race to remain unbound, got: %+v", remaining)
+	}
+}
+
+func TestAutoFillUnsyncedTurns_Limit(t *testing.T) {
+	tmpDir := t.TempDir()
+	markerPath := filepath.Join(tmpDir, "WACKYPUB_ROOT")
+	if err := os.WriteFile(markerPath, []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write WACKYPUB_ROOT: %v", err)
+	}
+
+	bobDir := filepath.Join(tmpDir, "bob")
+	if err := os.MkdirAll(bobDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bobDir, "AGENTS.md"), []byte("Prompt"), 0644); err != nil {
+		t.Fatalf("failed writing AGENTS.md: %v", err)
+	}
+
+	origCwd, _ := os.Getwd()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to tmpDir: %v", err)
+	}
+	defer os.Chdir(origCwd)
+
+	sdk := agent.NewSDK(tmpDir)
+
+	// Append 4 turns: user1, model1, user2, model2
+	t1 := genai.NewContentFromText("user msg 1", "user")
+	t2 := genai.NewContentFromText("model resp 1", "model")
+	t3 := genai.NewContentFromText("user msg 2", "user")
+	t4 := genai.NewContentFromText("model resp 2", "model")
+
+	_ = agent.AppendSessionContent(bobDir, t1)
+	_ = agent.AppendSessionContent(bobDir, t2)
+	_ = agent.AppendSessionContent(bobDir, t3)
+	_ = agent.AppendSessionContent(bobDir, t4)
+
+	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
+	st, err := NewState(stateFile)
+	if err != nil {
+		t.Fatalf("NewState failed: %v", err)
+	}
+
+	b := &Bot{
+		WsDir: tmpDir,
+		State: st,
+		SDK:   sdk,
+	}
+
+	// 1. limit = 2 on a fully synced session (simulating /fill limit:2)
+	binding := &ChannelBinding{
+		ChannelID:     "chan_test",
+		AgentID:       "bob",
+		LastTurnIndex: 3,
+		LastTurnHash:  ComputeTurnHash(t4),
+	}
+	_ = st.SetBinding(binding)
+
+	unlock := st.LockChannel("chan_test")
+	count, err := b.autoFillUnsyncedTurns(nil, binding, "chan_test", 2)
+	unlock()
+
+	if err != nil {
+		t.Fatalf("autoFillUnsyncedTurns failed: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected 2 turns backfilled, got %d", count)
+	}
+
+	// 2. limit = 10 on unsynced session (caps at total 4 turns)
+	binding.LastTurnIndex = -1
+	binding.LastTurnHash = ""
+	_ = st.SetBinding(binding)
+
+	unlock = st.LockChannel("chan_test")
+	count, err = b.autoFillUnsyncedTurns(nil, binding, "chan_test", 10)
+	unlock()
+
+	if err != nil {
+		t.Fatalf("autoFillUnsyncedTurns failed: %v", err)
+	}
+	if count != 4 {
+		t.Errorf("expected 4 turns backfilled when limit exceeds count, got %d", count)
+	}
+
+	// 3. Skip when IsGenerating is true
+	binding.IsGenerating = true
+	_ = st.SetBinding(binding)
+
+	unlock = st.LockChannel("chan_test")
+	count, err = b.autoFillUnsyncedTurns(nil, binding, "chan_test", 0)
+	unlock()
+
+	if err != nil {
+		t.Fatalf("autoFillUnsyncedTurns with IsGenerating true failed: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0 turns backfilled when IsGenerating is true, got %d", count)
+	}
+}
+
+func TestHandleFillCommand_Locking(t *testing.T) {
+	tmpDir := t.TempDir()
+	markerPath := filepath.Join(tmpDir, "WACKYPUB_ROOT")
+	if err := os.WriteFile(markerPath, []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write WACKYPUB_ROOT: %v", err)
+	}
+
+	bobDir := filepath.Join(tmpDir, "bob")
+	if err := os.MkdirAll(bobDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bobDir, "AGENTS.md"), []byte("Prompt"), 0644); err != nil {
+		t.Fatalf("failed writing AGENTS.md: %v", err)
+	}
+
+	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
+	st, err := NewState(stateFile)
+	if err != nil {
+		t.Fatalf("NewState failed: %v", err)
+	}
+
+	b := &Bot{
+		WsDir: tmpDir,
+		State: st,
+		SDK:   agent.NewSDK(tmpDir),
+	}
+
+	// 1. /fill on unbound channel
+	iUnbound := &discordgo.InteractionCreate{
+		Interaction: &discordgo.Interaction{
+			ChannelID: "unbound_chan",
+			Type:      discordgo.InteractionApplicationCommand,
+		},
+	}
+	b.handleFillCommand(nil, iUnbound)
+
+	// 2. /fill on bound channel while generating
+	_ = st.SetBinding(&ChannelBinding{
+		ChannelID:    "chan_gen",
+		AgentID:      "bob",
+		IsGenerating: true,
+	})
+
+	iGen := &discordgo.InteractionCreate{
+		Interaction: &discordgo.Interaction{
+			ChannelID: "chan_gen",
+			Type:      discordgo.InteractionApplicationCommand,
+		},
+	}
+	b.handleFillCommand(nil, iGen)
+
+	// 3. /fill acquires channel lock during operation
+	_ = st.SetBinding(&ChannelBinding{
+		ChannelID: "chan_lock_test",
+		AgentID:   "bob",
+	})
+
+	unlock := st.LockChannel("chan_lock_test")
+	lockAcquiredByFill := make(chan struct{})
+	go func() {
+		b.handleFillCommand(nil, &discordgo.InteractionCreate{
+			Interaction: &discordgo.Interaction{
+				ChannelID: "chan_lock_test",
+				Type:      discordgo.InteractionApplicationCommand,
+			},
+		})
+		close(lockAcquiredByFill)
+	}()
+
+	// Since we hold the lock, handleFillCommand must be blocked
+	select {
+	case <-lockAcquiredByFill:
+		t.Fatal("handleFillCommand should have blocked while channel lock was held")
+	case <-time.After(50 * time.Millisecond):
+		// Expected
+	}
+
+	unlock()
+
+	select {
+	case <-lockAcquiredByFill:
+		// Succeeded
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for handleFillCommand after unlocking channel")
+	}
+}
+
+func TestHandleUnbindCommand_Locking(t *testing.T) {
+	tmpDir := t.TempDir()
+	markerPath := filepath.Join(tmpDir, "WACKYPUB_ROOT")
+	if err := os.WriteFile(markerPath, []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write WACKYPUB_ROOT: %v", err)
+	}
+
+	bobDir := filepath.Join(tmpDir, "bob")
+	if err := os.MkdirAll(bobDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bobDir, "AGENTS.md"), []byte("Prompt"), 0644); err != nil {
+		t.Fatalf("failed writing AGENTS.md: %v", err)
+	}
+
+	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
+	st, err := NewState(stateFile)
+	if err != nil {
+		t.Fatalf("NewState failed: %v", err)
+	}
+
+	b := &Bot{
+		WsDir: tmpDir,
+		State: st,
+		SDK:   agent.NewSDK(tmpDir),
+	}
+
+	// 1. /unbind on unbound channel
+	iUnbound := &discordgo.InteractionCreate{
+		Interaction: &discordgo.Interaction{
+			ChannelID: "unbound_chan",
+			Type:      discordgo.InteractionApplicationCommand,
+		},
+	}
+	b.handleUnbindCommand(nil, iUnbound)
+
+	// 2. /unbind acquires channel lock during operation
+	_ = st.SetBinding(&ChannelBinding{
+		ChannelID: "chan_unbind_lock",
+		AgentID:   "bob",
+	})
+
+	unlock := st.LockChannel("chan_unbind_lock")
+	lockAcquiredByUnbind := make(chan struct{})
+	go func() {
+		b.handleUnbindCommand(nil, &discordgo.InteractionCreate{
+			Interaction: &discordgo.Interaction{
+				ChannelID: "chan_unbind_lock",
+				Type:      discordgo.InteractionApplicationCommand,
+			},
+		})
+		close(lockAcquiredByUnbind)
+	}()
+
+	// Since we hold the lock, handleUnbindCommand must be blocked
+	select {
+	case <-lockAcquiredByUnbind:
+		t.Fatal("handleUnbindCommand should have blocked while channel lock was held")
+	case <-time.After(50 * time.Millisecond):
+		// Expected
+	}
+
+	unlock()
+
+	select {
+	case <-lockAcquiredByUnbind:
+		// Succeeded
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for handleUnbindCommand after unlocking channel")
+	}
+
+	// Verify binding was removed
+	if st.GetBinding("chan_unbind_lock") != nil {
+		t.Errorf("expected chan_unbind_lock to be removed")
+	}
+}
+
+func TestHandleMessageCreate_AgentIDGuardMidGeneration(t *testing.T) {
+	tmpDir := t.TempDir()
+	markerPath := filepath.Join(tmpDir, "WACKYPUB_ROOT")
+	if err := os.WriteFile(markerPath, []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write WACKYPUB_ROOT: %v", err)
+	}
+
+	// 1. Create agent 'bob' with 2 session turns
+	bobDir := filepath.Join(tmpDir, "bob")
+	if err := os.MkdirAll(bobDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bobDir, "AGENTS.md"), []byte("I am Bob"), 0644); err != nil {
+		t.Fatalf("failed writing bob AGENTS.md: %v", err)
+	}
+	_ = agent.AppendSessionContent(bobDir, genai.NewContentFromText("bob turn 1", "user"))
+	_ = agent.AppendSessionContent(bobDir, genai.NewContentFromText("bob turn 2", "model"))
+
+	// 2. Create agent 'alice' with 5 session turns
+	aliceDir := filepath.Join(tmpDir, "alice")
+	if err := os.MkdirAll(aliceDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(aliceDir, "AGENTS.md"), []byte("I am Alice"), 0644); err != nil {
+		t.Fatalf("failed writing alice AGENTS.md: %v", err)
+	}
+	for j := 0; j < 5; j++ {
+		_ = agent.AppendSessionContent(aliceDir, genai.NewContentFromText(fmt.Sprintf("alice turn %d", j), "user"))
+	}
+
+	origCwd, _ := os.Getwd()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to tmpDir: %v", err)
+	}
+	defer os.Chdir(origCwd)
+
+	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
+	st, err := NewState(stateFile)
+	if err != nil {
+		t.Fatalf("NewState failed: %v", err)
+	}
+
+	b := &Bot{
+		WsDir: tmpDir,
+		State: st,
+		SDK:   agent.NewSDK(tmpDir),
+	}
+
+	// Channel initially bound to bob
+	_ = st.SetBinding(&ChannelBinding{
+		ChannelID:     "chan_rebind",
+		AgentID:       "bob",
+		LastTurnIndex: 1,
+		LastTurnHash:  "bob_hash_1",
+	})
+
+	// Hold session lock on bobDir so HandleMessageCreate pauses while IsGenerating is true,
+	// allowing us to deterministically simulate a concurrent rebind to alice mid-generation.
+	lock, err := agent.AcquireSessionLock(bobDir)
+	if err != nil {
+		t.Fatalf("AcquireSessionLock failed: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		b.HandleMessageCreate(nil, &discordgo.MessageCreate{
+			Message: &discordgo.Message{
+				ChannelID: "chan_rebind",
+				Content:   "hello bob",
+				Author:    &discordgo.User{ID: "user1", Bot: false},
+			},
+		})
+		close(done)
+	}()
+
+	// Wait for HandleMessageCreate to mark the channel as actively generating
+	for {
+		bnd := st.GetBinding("chan_rebind")
+		if bnd != nil && bnd.IsGenerating && bnd.AgentID == "bob" {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+
+	// Rebind channel to alice while bob is mid-generation
+	_ = st.SetBinding(&ChannelBinding{
+		ChannelID:     "chan_rebind",
+		AgentID:       "alice",
+		LastTurnIndex: 4,
+		LastTurnHash:  "alice_hash_4",
+	})
+
+	// Release bob's lock so HandleMessageCreate can proceed and finish
+	lock.Release()
+
+	select {
+	case <-done:
+		// Succeeded
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for HandleMessageCreate to complete")
+	}
+
+	// Verify alice's binding was NOT corrupted with bob's sync markers
+	finalBnd := st.GetBinding("chan_rebind")
+	if finalBnd == nil {
+		t.Fatalf("expected chan_rebind to still be bound")
+	}
+	if finalBnd.AgentID != "alice" {
+		t.Errorf("expected AgentID to be alice, got %q", finalBnd.AgentID)
+	}
+	if finalBnd.LastTurnIndex != 4 {
+		t.Errorf("expected LastTurnIndex to remain 4 (alice), got %d (corrupted by bob's generation)", finalBnd.LastTurnIndex)
+	}
+	if finalBnd.LastTurnHash != "alice_hash_4" {
+		t.Errorf("expected LastTurnHash to remain alice_hash_4, got %q", finalBnd.LastTurnHash)
 	}
 }

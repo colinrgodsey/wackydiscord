@@ -15,6 +15,9 @@ const (
 // EnsureWebhook finds an existing WackyPub webhook in the channel, or creates a new one.
 // Returns nil if the bot does not have permissions to manage webhooks or if the channel is a DM.
 func EnsureWebhook(s *discordgo.Session, channelID string) (*discordgo.Webhook, error) {
+	if s == nil {
+		return nil, nil
+	}
 	// Webhooks cannot be created in DMs
 	ch, err := s.Channel(channelID)
 	if err != nil {
@@ -45,6 +48,9 @@ func EnsureWebhook(s *discordgo.Session, channelID string) (*discordgo.Webhook, 
 // It uses channel webhooks for persona/custom username impersonation when available,
 // and gracefully falls back to standard bot message delivery when webhooks are disabled or fail.
 func SendAgentMessage(s *discordgo.Session, channelID string, agentID string, content string, webhook *discordgo.Webhook) error {
+	if s == nil {
+		return nil
+	}
 	chunks := SplitDiscordMessage(content)
 	if len(chunks) == 0 {
 		return nil

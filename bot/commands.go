@@ -94,6 +94,7 @@ func (b *Bot) HandleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 }
 
 func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// TODO(fast-follow): Acquire State.LockChannel(i.ChannelID) to serialize binding creation with in-flight operations.
 	agentID := ""
 	for _, opt := range i.ApplicationCommandData().Options {
 		if opt.Name == "agent" {
@@ -166,6 +167,15 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 }
 
 func (b *Bot) handleUnbindCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// Pre-lock existence check
+	if b.State.GetBinding(i.ChannelID) == nil {
+		b.respondInteraction(s, i, "ℹ️ This channel is not currently bound to any agent.", true)
+		return
+	}
+
+	unlock := b.State.LockChannel(i.ChannelID)
+	defer unlock()
+
 	binding := b.State.GetBinding(i.ChannelID)
 	if binding == nil {
 		b.respondInteraction(s, i, "ℹ️ This channel is not currently bound to any agent.", true)
@@ -241,16 +251,32 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, i *discordgo.Interaction
 }
 
 func (b *Bot) handleFillCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	binding := b.State.GetBinding(i.ChannelID)
-	if binding == nil {
+	// Pre-lock existence check
+	if b.State.GetBinding(i.ChannelID) == nil {
 		b.respondInteraction(s, i, "❌ This channel is not bound to any agent. Use `/bind <agent_id>` first.", true)
 		return
 	}
 
 	// Defer response to allow backfill processing
-	_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
-	})
+	if s != nil && i != nil && i.Interaction != nil {
+		_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		})
+	}
+
+	unlock := b.State.LockChannel(i.ChannelID)
+	defer unlock()
+
+	binding := b.State.GetBinding(i.ChannelID)
+	if binding == nil {
+		b.editInteractionResponse(s, i, "❌ This channel is not bound to any agent. Use `/bind <agent_id>` first.")
+		return
+	}
+
+	if binding.IsGenerating {
+		b.editInteractionResponse(s, i, "⚠️ Agent is currently generating; please wait for generation to complete before running `/fill`.")
+		return
+	}
 
 	insp, err := b.SDK.InspectAgent(binding.AgentID)
 	if err != nil || insp == nil || !insp.AgentDirExists {
@@ -258,74 +284,31 @@ func (b *Bot) handleFillCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
-	turns, err := b.SDK.ReadSession(binding.AgentID)
+	limit := -1
+	if i != nil && i.Data != nil {
+		for _, opt := range i.ApplicationCommandData().Options {
+			if opt.Name == "limit" {
+				limit = int(opt.IntValue())
+			}
+		}
+	}
+
+	count, err := b.autoFillUnsyncedTurns(s, binding, i.ChannelID, limit)
 	if err != nil {
-		b.editInteractionResponse(s, i, fmt.Sprintf("❌ Failed to read session turns: %v", err))
+		b.editInteractionResponse(s, i, fmt.Sprintf("❌ Failed to backfill session turns: %v", err))
 		return
 	}
 
-	limit := -1
-	for _, opt := range i.ApplicationCommandData().Options {
-		if opt.Name == "limit" {
-			limit = int(opt.IntValue())
-		}
-	}
-
-	unsynced, newIdx, newHash := DiffUnsyncedTurns(turns, binding.LastTurnHash, binding.LastTurnIndex)
-	if limit > 0 && len(unsynced) == 0 && len(turns) > 0 {
-		if limit > len(turns) {
-			limit = len(turns)
-		}
-		unsynced = turns[len(turns)-limit:]
-	} else if limit > 0 && len(unsynced) > limit {
-		unsynced = unsynced[len(unsynced)-limit:]
-	}
-
-	if len(unsynced) == 0 {
+	if count == 0 {
 		b.editInteractionResponse(s, i, "✅ Channel is already up to date with session history.")
 		return
 	}
 
-	b.editInteractionResponse(s, i, fmt.Sprintf("🔄 Backfilling %d session turns for **%s**...", len(unsynced), binding.AgentID))
-
-	var wh *discordgo.Webhook
-	if binding.WebhookID != "" && binding.WebhookToken != "" {
-		wh = &discordgo.Webhook{ID: binding.WebhookID, Token: binding.WebhookToken}
-	}
-
-	for _, turn := range unsynced {
-		if turn.Role == "user" {
-			if binding.Verbose {
-				toolText := FormatToolTurnSummary(turn)
-				if toolText != "" {
-					_ = SendAgentMessage(s, i.ChannelID, "Tools", toolText, nil)
-				}
-			}
-			text := FormatUserBackfillMessage(turn)
-			if text != "" {
-				_ = SendAgentMessage(s, i.ChannelID, "User", text, nil)
-			}
-		} else {
-			if binding.Verbose {
-				toolText := FormatToolTurnSummary(turn)
-				if toolText != "" {
-					_ = SendAgentMessage(s, i.ChannelID, "Tools", toolText, nil)
-				}
-			}
-			text := FormatAssistantBackfillMessage(turn)
-			if text != "" {
-				text = ExpandScratchpadSentinels(b.SDK, binding.AgentID, text)
-				_ = SendAgentMessage(s, i.ChannelID, binding.AgentID, text, wh)
-			}
-		}
-	}
-
-	binding.LastTurnIndex = newIdx
-	binding.LastTurnHash = newHash
-	_ = b.State.SetBinding(binding)
+	b.editInteractionResponse(s, i, fmt.Sprintf("✅ Backfilled %d session turns for **%s**.", count, binding.AgentID))
 }
 
 func (b *Bot) handleVerboseCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// TODO(fast-follow): Acquire State.LockChannel(i.ChannelID) to serialize verbose toggle with concurrent message handlers.
 	binding := b.State.GetBinding(i.ChannelID)
 	if binding == nil {
 		b.respondInteraction(s, i, "❌ This channel is not bound to any agent. Use `/bind <agent_id>` first.", true)
@@ -388,6 +371,9 @@ func (b *Bot) handleAgentsCommand(s *discordgo.Session, i *discordgo.Interaction
 }
 
 func (b *Bot) respondInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, message string, ephemeral bool) {
+	if s == nil || i == nil || i.Interaction == nil {
+		return
+	}
 	flags := discordgo.MessageFlags(0)
 	if ephemeral {
 		flags = discordgo.MessageFlagsEphemeral
@@ -403,6 +389,9 @@ func (b *Bot) respondInteraction(s *discordgo.Session, i *discordgo.InteractionC
 }
 
 func (b *Bot) editInteractionResponse(s *discordgo.Session, i *discordgo.InteractionCreate, message string) {
+	if s == nil || i == nil || i.Interaction == nil {
+		return
+	}
 	_, _ = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 		Content: &message,
 	})

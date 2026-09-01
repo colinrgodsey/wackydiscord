@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -21,6 +22,15 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		return
 	}
 
+	// Pre-lock existence check: fast path to skip unbound channels without allocating a channel mutex
+	if b.State.GetBinding(m.ChannelID) == nil {
+		return
+	}
+
+	unlock := b.State.LockChannel(m.ChannelID)
+	defer unlock()
+
+	// Post-lock fresh read: guarantees up-to-date binding snapshot under lock and guards unbinding race
 	binding := b.State.GetBinding(m.ChannelID)
 	if binding == nil {
 		return
@@ -38,7 +48,9 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 	}
 
 	// 1. Auto-fill check: replay any background session turns that occurred since last sync
-	b.autoFillUnsyncedTurns(s, binding, m.ChannelID)
+	if _, err := b.autoFillUnsyncedTurns(s, binding, m.ChannelID, 0); err != nil {
+		log.Printf("⚠️ auto-fill unsynced turns error in channel %s: %v", m.ChannelID, err)
+	}
 
 	// 2. Prepare user message text & attachments
 	userText := strings.TrimSpace(m.Content)
@@ -70,31 +82,41 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 	userTurnContent := genai.NewContentFromText(userText, "user")
 	binding.PendingUserHash = ComputeTurnHash(userTurnContent)
 	binding.IsGenerating = true
-	_ = b.State.SetBinding(binding)
+	if err := b.State.SetBinding(binding); err != nil {
+		log.Printf("⚠️ failed to persist IsGenerating state in channel %s: %v", m.ChannelID, err)
+	}
 
 	defer func() {
 		bnd := b.State.GetBinding(m.ChannelID)
 		if bnd != nil && bnd.IsGenerating {
+			if bnd.AgentID != binding.AgentID {
+				log.Printf("⚠️ channel %s was rebound to agent %q during generation for %q; skipping deferred IsGenerating reset", m.ChannelID, bnd.AgentID, binding.AgentID)
+				return
+			}
 			bnd.IsGenerating = false
-			_ = b.State.SetBinding(bnd)
+			if err := b.State.SetBinding(bnd); err != nil {
+				log.Printf("⚠️ failed to reset IsGenerating in channel %s: %v", m.ChannelID, err)
+			}
 		}
 	}()
 
 	stopTyping := make(chan struct{})
-	go func() {
-		// Send initial typing indicator
-		_ = s.ChannelTyping(m.ChannelID)
-		ticker := time.NewTicker(6 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				_ = s.ChannelTyping(m.ChannelID)
-			case <-stopTyping:
-				return
+	if s != nil {
+		go func() {
+			// Send initial typing indicator
+			_ = s.ChannelTyping(m.ChannelID)
+			ticker := time.NewTicker(6 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					_ = s.ChannelTyping(m.ChannelID)
+				case <-stopTyping:
+					return
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	// 4. Ensure Webhook is available for persona delivery
 	var wh *discordgo.Webhook
@@ -104,7 +126,9 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		wh = newWH
 		binding.WebhookID = newWH.ID
 		binding.WebhookToken = newWH.Token
-		_ = b.State.SetBinding(binding)
+		if err := b.State.SetBinding(binding); err != nil {
+			log.Printf("⚠️ failed to persist webhook for channel %s: %v", m.ChannelID, err)
+		}
 	}
 
 	ctx := context.Background()
@@ -138,12 +162,20 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 			}
 		}
 
-		binding.LastTurnIndex = len(allTurns) - 1
-		binding.LastTurnHash = ComputeTurnHash(allTurns[binding.LastTurnIndex])
-		binding.PendingUserHash = ""
-		binding.PendingUserText = ""
-		binding.IsGenerating = false
-		_ = b.State.SetBinding(binding)
+		if bnd := b.State.GetBinding(m.ChannelID); bnd != nil {
+			if bnd.AgentID == binding.AgentID {
+				bnd.LastTurnIndex = len(allTurns) - 1
+				bnd.LastTurnHash = ComputeTurnHash(allTurns[bnd.LastTurnIndex])
+				bnd.PendingUserHash = ""
+				bnd.PendingUserText = ""
+			} else {
+				log.Printf("⚠️ channel %s was rebound to agent %q during generation for %q; skipping sync-marker update", m.ChannelID, bnd.AgentID, binding.AgentID)
+			}
+			bnd.IsGenerating = false
+			if err := b.State.SetBinding(bnd); err != nil {
+				log.Printf("⚠️ failed to update binding after generation in channel %s: %v", m.ChannelID, err)
+			}
+		}
 	}
 
 	if streamErr != nil {
@@ -152,19 +184,35 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 	}
 }
 
-func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBinding, channelID string) {
+// autoFillUnsyncedTurns replays background session turns not yet seen in Discord.
+// Caller MUST already hold the per-channel lock (via State.LockChannel) to avoid concurrency races (D76).
+// If limit > 0, backfills at most limit turns (or the last limit turns if fully synced).
+// Returns the number of turns backfilled and any persistence error.
+func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBinding, channelID string, limit int) (int, error) {
 	if binding == nil || binding.IsGenerating {
-		return
+		return 0, nil
 	}
 
 	turns, err := b.SDK.ReadSession(binding.AgentID)
-	if err != nil || len(turns) == 0 {
-		return
+	if err != nil {
+		return 0, fmt.Errorf("failed to read session turns: %w", err)
+	}
+	if len(turns) == 0 {
+		return 0, nil
 	}
 
 	unsynced, newIdx, newHash := DiffUnsyncedTurns(turns, binding.LastTurnHash, binding.LastTurnIndex)
+	if limit > 0 && len(unsynced) == 0 && len(turns) > 0 {
+		if limit > len(turns) {
+			limit = len(turns)
+		}
+		unsynced = turns[len(turns)-limit:]
+	} else if limit > 0 && len(unsynced) > limit {
+		unsynced = unsynced[len(unsynced)-limit:]
+	}
+
 	if len(unsynced) == 0 {
-		return
+		return 0, nil
 	}
 
 	var wh *discordgo.Webhook
@@ -212,7 +260,10 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 
 	binding.LastTurnIndex = newIdx
 	binding.LastTurnHash = newHash
-	_ = b.State.SetBinding(binding)
+	if err := b.State.SetBinding(binding); err != nil {
+		return len(unsynced), fmt.Errorf("failed to update binding sync markers: %w", err)
+	}
+	return len(unsynced), nil
 }
 
 func downloadAttachment(url string) ([]byte, error) {

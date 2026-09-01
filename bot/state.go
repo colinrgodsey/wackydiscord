@@ -30,16 +30,19 @@ type ChannelBinding struct {
 
 // State manages channel-to-agent bindings across bot restarts.
 type State struct {
-	mu       sync.RWMutex
-	filePath string
-	Bindings map[string]*ChannelBinding `json:"bindings"`
+	mu          sync.RWMutex
+	chanLocksMu sync.Mutex
+	chanLocks   map[string]*sync.Mutex
+	filePath    string
+	Bindings    map[string]*ChannelBinding `json:"bindings"`
 }
 
 // NewState loads or initializes state from the specified JSON file.
 func NewState(filePath string) (*State, error) {
 	s := &State{
-		filePath: filePath,
-		Bindings: make(map[string]*ChannelBinding),
+		filePath:  filePath,
+		Bindings:  make(map[string]*ChannelBinding),
+		chanLocks: make(map[string]*sync.Mutex),
 	}
 
 	if data, err := os.ReadFile(filePath); err == nil {
@@ -59,6 +62,29 @@ func NewState(filePath string) (*State, error) {
 	}
 
 	return s, nil
+}
+
+// LockChannel acquires the per-channel mutex for the specified channelID (lazily creating
+// it if needed) and returns an unlock function. Callers should hold the lock via defer
+// to serialize multi-step ChannelBinding read-modify-write operations per D76.
+//
+// WARNING: sync.Mutex is not reentrant - calling LockChannel from a code path that already holds the channel lock will deadlock.
+func (s *State) LockChannel(channelID string) func() {
+	s.chanLocksMu.Lock()
+	if s.chanLocks == nil {
+		s.chanLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := s.chanLocks[channelID]
+	if !ok {
+		mu = &sync.Mutex{}
+		s.chanLocks[channelID] = mu
+	}
+	s.chanLocksMu.Unlock()
+
+	mu.Lock()
+	return func() {
+		mu.Unlock()
+	}
 }
 
 // GetBinding retrieves the binding for a channel, returning nil if unbound.
