@@ -57,6 +57,10 @@ var SlashCommands = []*discordgo.ApplicationCommand{
 		Name:        "agents",
 		Description: "List all agents discovered in the WackyPub workspace",
 	},
+	{
+		Name:        "stop",
+		Description: "Cancel the in-flight turn of the bound agent",
+	},
 }
 
 // RegisterSlashCommands registers all application commands globally or for a specific guild.
@@ -90,6 +94,8 @@ func (b *Bot) HandleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 		b.handleVerboseCommand(s, i)
 	case "agents":
 		b.handleAgentsCommand(s, i)
+	case "stop":
+		b.handleStopCommand(s, i)
 	}
 }
 
@@ -368,6 +374,21 @@ func (b *Bot) handleAgentsCommand(s *discordgo.Session, i *discordgo.Interaction
 	}
 
 	b.respondInteraction(s, i, sb.String(), false)
+}
+
+func (b *Bot) handleStopCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	binding := b.State.GetBinding(i.ChannelID)
+	if binding == nil {
+		b.respondInteraction(s, i, "ℹ️ This channel is not currently bound to any agent. Use `/bind <agent_id>` to connect one.", true)
+		return
+	}
+
+	if err := b.SDK.CancelTurn(binding.AgentID); err != nil {
+		b.respondInteraction(s, i, fmt.Sprintf("ℹ️ No in-flight turn for agent **%s**.", binding.AgentID), false)
+		return
+	}
+
+	b.respondInteraction(s, i, fmt.Sprintf("⏹️ Turn cancelled for agent **%s**.", binding.AgentID), false)
 }
 
 func (b *Bot) respondInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, message string, ephemeral bool) {

@@ -1,7 +1,12 @@
 package bot
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1083,5 +1088,240 @@ func TestHandleMessageCreate_AgentIDGuardMidGeneration(t *testing.T) {
 	}
 	if finalBnd.LastTurnHash != "alice_hash_4" {
 		t.Errorf("expected LastTurnHash to remain alice_hash_4, got %q", finalBnd.LastTurnHash)
+	}
+}
+
+type fakeRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f fakeRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func TestStopCommand(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
+	st, err := NewState(stateFile)
+	if err != nil {
+		t.Fatalf("NewState failed: %v", err)
+	}
+
+	sdk := agent.NewSDK(tmpDir)
+	b := &Bot{
+		WsDir: tmpDir,
+		State: st,
+		SDK:   sdk,
+	}
+
+	var capturedResponse string
+	s, err := discordgo.New("Bot fake-token")
+	if err != nil {
+		t.Fatalf("discordgo.New failed: %v", err)
+	}
+	s.Client.Transport = fakeRoundTripper(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		var resp discordgo.InteractionResponse
+		_ = json.Unmarshal(body, &resp)
+		if resp.Data != nil {
+			capturedResponse = resp.Data.Content
+		}
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader("{}")),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	// 1. Unbound channel
+	iUnbound := &discordgo.InteractionCreate{
+		Interaction: &discordgo.Interaction{
+			ID:        "int_1",
+			Token:     "tok_1",
+			ChannelID: "chan_unbound",
+			Type:      discordgo.InteractionApplicationCommand,
+		},
+	}
+	b.handleStopCommand(s, iUnbound)
+	if !strings.Contains(capturedResponse, "not currently bound") {
+		t.Errorf("expected unbound message, got: %q", capturedResponse)
+	}
+
+	// 2. Bound channel, but no in-flight turn
+	_ = st.SetBinding(&ChannelBinding{
+		ChannelID: "chan_bound",
+		AgentID:   "bob",
+	})
+	iBound := &discordgo.InteractionCreate{
+		Interaction: &discordgo.Interaction{
+			ID:        "int_2",
+			Token:     "tok_2",
+			ChannelID: "chan_bound",
+			Type:      discordgo.InteractionApplicationCommand,
+		},
+	}
+	capturedResponse = ""
+	b.handleStopCommand(s, iBound)
+	if !strings.Contains(capturedResponse, "No in-flight turn for agent") || !strings.Contains(capturedResponse, "bob") {
+		t.Errorf("expected no in-flight turn message mentioning bob, got: %q", capturedResponse)
+	}
+
+	// 3. Bound channel with an in-flight turn:
+	bobDir := filepath.Join(tmpDir, "bob")
+	if err := os.MkdirAll(bobDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	_ = os.WriteFile(filepath.Join(bobDir, "AGENTS.md"), []byte("Bob system prompt"), 0644)
+	_ = os.WriteFile(filepath.Join(bobDir, agent.AllowedAgentsFile), []byte("bob\n"), 0644)
+
+	requestStarted := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		close(requestStarted)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	runtimeJSON := fmt.Sprintf(`{"model":"test-model","endpoint":%q}`, srv.URL)
+	_ = os.WriteFile(filepath.Join(bobDir, "runtime.json"), []byte(runtimeJSON), 0644)
+
+	origCwd, _ := os.Getwd()
+	_ = os.Chdir(bobDir)
+	defer os.Chdir(origCwd)
+
+	streamDone := make(chan struct{})
+	go func() {
+		for range sdk.AddAndGenerateTurnStream(context.Background(), "bob", "Hello") {
+		}
+		close(streamDone)
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for request to start")
+	}
+
+	// Invoke /stop while turn is in-flight
+	capturedResponse = ""
+	b.handleStopCommand(s, iBound)
+	if !strings.Contains(capturedResponse, "Turn cancelled for agent") || !strings.Contains(capturedResponse, "bob") {
+		t.Errorf("expected turn cancelled message mentioning bob, got: %q", capturedResponse)
+	}
+
+	select {
+	case <-streamDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for stream to finish after stop")
+	}
+}
+
+func TestHandleMessageCreate_TurnStoppedOnCancel(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
+	st, err := NewState(stateFile)
+	if err != nil {
+		t.Fatalf("NewState failed: %v", err)
+	}
+
+	bobDir := filepath.Join(tmpDir, "bob")
+	if err := os.MkdirAll(bobDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	_ = os.WriteFile(filepath.Join(bobDir, "AGENTS.md"), []byte("Bob prompt"), 0644)
+	_ = os.WriteFile(filepath.Join(bobDir, agent.AllowedAgentsFile), []byte("bob\n"), 0644)
+
+	requestStarted := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		close(requestStarted)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	runtimeJSON := fmt.Sprintf(`{"model":"test-model","endpoint":%q}`, srv.URL)
+	_ = os.WriteFile(filepath.Join(bobDir, "runtime.json"), []byte(runtimeJSON), 0644)
+
+	origCwd, _ := os.Getwd()
+	_ = os.Chdir(bobDir)
+	defer os.Chdir(origCwd)
+
+	_ = st.SetBinding(&ChannelBinding{
+		ChannelID: "chan_stop_msg",
+		AgentID:   "bob",
+	})
+
+	var mu sync.Mutex
+	var sentMessages []string
+	s, _ := discordgo.New("Bot fake-token")
+	s.Client.Transport = fakeRoundTripper(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		var msg discordgo.MessageSend
+		_ = json.Unmarshal(body, &msg)
+		mu.Lock()
+		sentMessages = append(sentMessages, msg.Content)
+		mu.Unlock()
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(`{"id":"msg_1"}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	sdk := agent.NewSDK(tmpDir)
+	b := &Bot{
+		WsDir: tmpDir,
+		State: st,
+		SDK:   sdk,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		b.HandleMessageCreate(s, &discordgo.MessageCreate{
+			Message: &discordgo.Message{
+				ID:        "user_msg_1",
+				ChannelID: "chan_stop_msg",
+				Content:   "Start turn",
+				Author:    &discordgo.User{ID: "u1", Bot: false},
+			},
+		})
+		close(done)
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for turn to start")
+	}
+
+	// Cancel the turn via SDK
+	if err := b.SDK.CancelTurn("bob"); err != nil {
+		t.Fatalf("CancelTurn failed: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for HandleMessageCreate to finish after cancel")
+	}
+
+	mu.Lock()
+	msgs := append([]string{}, sentMessages...)
+	mu.Unlock()
+
+	foundStopped := false
+	foundError := false
+	for _, m := range msgs {
+		if strings.Contains(m, "Turn stopped") {
+			foundStopped = true
+		}
+		if strings.Contains(m, "Agent error") {
+			foundError = true
+		}
+	}
+
+	if !foundStopped {
+		t.Errorf("expected 'Turn stopped' message in sent messages, got: %v", msgs)
+	}
+	if foundError {
+		t.Errorf("expected NO 'Agent error' message for cancelled turn, got: %v", msgs)
 	}
 }
