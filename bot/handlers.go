@@ -137,7 +137,9 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 	startIdx := len(initialTurns)
 
 	var streamErr error
-	for chunk, err := range b.SDK.AddAndGenerateTurnStream(ctx, binding.AgentID, userText) {
+	for chunk, err := range b.SDK.AddAndGenerateTurnStream(ctx, binding.AgentID, userText, func(w string) {
+		log.Printf("⚠️ hook warning for agent %s: %s", binding.AgentID, w)
+	}) {
 		if err != nil {
 			streamErr = err
 			break
