@@ -133,8 +133,6 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 	}
 
 	ctx := context.Background()
-	initialTurns, _ := b.SDK.ReadSession(binding.AgentID)
-	startIdx := len(initialTurns)
 
 	var streamErr error
 	for chunk, err := range b.SDK.AddAndGenerateTurnStream(ctx, binding.AgentID, userText, func(w string) {
@@ -154,10 +152,9 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 	// 5. Read newly generated turns, emit verbose tool logs if enabled, and update sync marker
 	allTurns, _ := b.SDK.ReadSession(binding.AgentID)
 	if len(allTurns) > 0 {
-		if binding.Verbose && len(allTurns) > startIdx+1 {
-			// allTurns[startIdx] is the newly appended user message.
-			// allTurns[startIdx+1 : len(allTurns)-1] are intermediate tool calls and responses.
-			for _, turn := range allTurns[startIdx+1:] {
+		if binding.Verbose {
+			unsynced, _, _ := DiffUnsyncedTurns(allTurns, binding.LastTurnHash, binding.LastTurnIndex)
+			for _, turn := range unsynced {
 				toolText := FormatToolTurnSummary(turn)
 				if toolText != "" {
 					_ = SendAgentMessage(s, m.ChannelID, "Tools", toolText, nil)
