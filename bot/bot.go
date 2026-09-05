@@ -159,16 +159,9 @@ func (b *Bot) SyncAgentToChannels(agentID string) {
 	bindings := b.State.GetAllBindings()
 	for _, binding := range bindings {
 		if binding.AgentID == agentID {
-			unlock := b.State.LockChannel(binding.ChannelID)
-			// Load-bearing: re-fetch fresh binding snapshot under the per-channel lock to prevent
-			// overwriting mutations made by HandleMessageCreate/handleFillCommand while waiting for lock (D76).
-			currentBinding := b.State.GetBinding(binding.ChannelID)
-			if currentBinding != nil {
-				if _, err := b.autoFillUnsyncedTurns(b.Session, currentBinding, binding.ChannelID, 0); err != nil {
-					log.Printf("⚠️ background auto-sync error for agent %s in channel %s: %v", agentID, binding.ChannelID, err)
-				}
+			if _, err := b.autoFillUnsyncedTurns(b.Session, nil, binding.ChannelID, 0); err != nil {
+				log.Printf("⚠️ background auto-sync error for agent %s in channel %s: %v", agentID, binding.ChannelID, err)
 			}
-			unlock()
 		}
 	}
 }

@@ -76,9 +76,60 @@ func DiffUnsyncedTurns(turns []*genai.Content, lastHash string, lastIndex int) (
 		return nil, newLastIdx, newLastHash
 	}
 
-	// Case 4: Hash not found (session was truncated/pruned from the end, or completely reset).
+	// Case 4: Hash not found. Compaction may have pruned the turn matching lastHash.
+	// Look for compaction notice or continuation turn to resume diffing from post-compaction turns.
+	for i := len(turns) - 1; i >= 0; i-- {
+		text := agent.ContentText(turns[i])
+		if strings.Contains(text, "<COMPACTION_NOTICE") || strings.Contains(text, "<CONTINUATION") {
+			if i+1 < len(turns) {
+				return turns[i+1:], newLastIdx, newLastHash
+			}
+			return nil, newLastIdx, newLastHash
+		}
+	}
+
+	// Case 5: Hash not found (session was truncated/pruned from the end, or completely reset).
 	// Do NOT replay historical prefix turns into the channel; simply update the sync markers.
 	return nil, newLastIdx, newLastHash
+}
+
+// IsSyntheticHarnessTurn checks if a turn is a synthetic harness sentinel turn injected by D88
+// (such as post-compaction continuation, scratchpad image injection, or compaction notice).
+func IsSyntheticHarnessTurn(turn *genai.Content) bool {
+	if turn == nil || turn.Role != "user" {
+		return false
+	}
+	text := strings.TrimSpace(agent.ContentText(turn))
+	return strings.HasPrefix(text, "<CONTINUATION") ||
+		strings.HasPrefix(text, "<IMAGE") ||
+		strings.HasPrefix(text, "<COMPACTION_NOTICE")
+}
+
+// FormatSyntheticHarnessTurn renders synthetic harness turns as subtle status badges in verbose mode.
+func FormatSyntheticHarnessTurn(turn *genai.Content) string {
+	if turn == nil {
+		return ""
+	}
+	text := strings.TrimSpace(agent.ContentText(turn))
+	if strings.HasPrefix(text, "<CONTINUATION") {
+		re := regexp.MustCompile(`reason="([^"]+)"`)
+		match := re.FindStringSubmatch(text)
+		if len(match) > 1 {
+			reason := match[1]
+			if reason == "post-compaction" {
+				return "🔄 **[Auto-Continuation]** Post-compaction resume"
+			}
+			return fmt.Sprintf("🔄 **[Auto-Continuation]** %s", reason)
+		}
+		return "🔄 **[Auto-Continuation]** Resume"
+	}
+	if strings.HasPrefix(text, "<IMAGE") {
+		return "🔄 **[Auto-Continuation]** Image processing"
+	}
+	if strings.HasPrefix(text, "<COMPACTION_NOTICE") {
+		return "🔄 **[Auto-Continuation]** Compaction notice"
+	}
+	return "🔄 **[Auto-Continuation]**"
 }
 
 // FormatUserBackfillMessage formats an unsynced background user turn with clear blockquotes and attribution.

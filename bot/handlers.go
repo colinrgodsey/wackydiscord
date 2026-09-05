@@ -25,8 +25,8 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		return
 	}
 
-	unlock := b.State.LockChannel(m.ChannelID)
-	defer unlock()
+	turnUnlock := b.State.LockChannelTurn(m.ChannelID)
+	defer turnUnlock()
 
 	// Post-lock fresh read: guarantees up-to-date binding snapshot under lock and guards unbinding race
 	binding := b.State.GetBinding(m.ChannelID)
@@ -81,16 +81,59 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		return
 	}
 
-	// 3. Mark channel as actively generating to prevent file watcher race & echoes
-	binding.PendingUserText = userText
-	userTurnContent := genai.NewContentFromText(userText, "user")
-	binding.PendingUserHash = ComputeTurnHash(userTurnContent)
-	binding.IsGenerating = true
-	if err := b.State.SetBinding(binding); err != nil {
-		log.Printf("⚠️ failed to persist IsGenerating state in channel %s: %v", m.ChannelID, err)
+	// 3. Atomic registration: Under LockChannelSync, perform [AddUserTurn + AddPendingUserHash]
+	var res *agent.UserTurnResult
+	var addErr error
+
+	func() {
+		syncUnlock := b.State.LockChannelSync(m.ChannelID)
+		defer syncUnlock()
+
+		bnd := b.State.GetBinding(m.ChannelID)
+		if bnd == nil || bnd.AgentID != binding.AgentID {
+			return
+		}
+
+		bnd.IsGenerating = true
+		_ = b.State.SetBinding(bnd)
+
+		res, addErr = b.SDK.AddUserTurn(binding.AgentID, userText)
+		if addErr != nil {
+			return
+		}
+
+		freshBnd := b.State.GetBinding(m.ChannelID)
+		if freshBnd != nil && freshBnd.AgentID == binding.AgentID {
+			actualHash := ComputeTurnHash(res.Content)
+			freshBnd.AddPendingUserHash(actualHash)
+			freshBnd.IsGenerating = true
+			if freshBnd.LastTurnHash == "" {
+				freshBnd.LastTurnIndex = 0
+				freshBnd.LastTurnHash = actualHash
+			}
+			if err := b.State.SetBinding(freshBnd); err != nil {
+				log.Printf("⚠️ failed to persist IsGenerating state in channel %s: %v", m.ChannelID, err)
+			}
+		}
+	}()
+
+	if addErr != nil {
+		_ = SendAgentMessage(s, m.ChannelID, "System", fmt.Sprintf("❌ **Turn error:** %v", addErr), nil)
+		return
+	}
+
+	if res == nil {
+		return
+	}
+
+	for _, w := range res.Warnings {
+		log.Printf("⚠️ hook warning for agent %s: %s", binding.AgentID, w)
 	}
 
 	defer func() {
+		syncUnlock := b.State.LockChannelSync(m.ChannelID)
+		defer syncUnlock()
+
 		bnd := b.State.GetBinding(m.ChannelID)
 		if bnd != nil && bnd.IsGenerating {
 			if bnd.AgentID != binding.AgentID {
@@ -123,62 +166,46 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 	}
 
 	// 4. Ensure Webhook is available for persona delivery
-	var wh *discordgo.Webhook
-	if binding.WebhookID != "" && binding.WebhookToken != "" {
-		wh = &discordgo.Webhook{ID: binding.WebhookID, Token: binding.WebhookToken}
-	} else if newWH, err := EnsureWebhook(s, m.ChannelID); err == nil && newWH != nil {
-		wh = newWH
-		binding.WebhookID = newWH.ID
-		binding.WebhookToken = newWH.Token
-		if err := b.State.SetBinding(binding); err != nil {
-			log.Printf("⚠️ failed to persist webhook for channel %s: %v", m.ChannelID, err)
+	if binding.WebhookID == "" || binding.WebhookToken == "" {
+		if newWH, err := EnsureWebhook(s, m.ChannelID); err == nil && newWH != nil {
+			func() {
+				syncUnlock := b.State.LockChannelSync(m.ChannelID)
+				defer syncUnlock()
+				if bnd := b.State.GetBinding(m.ChannelID); bnd != nil && bnd.AgentID == binding.AgentID {
+					bnd.WebhookID = newWH.ID
+					bnd.WebhookToken = newWH.Token
+					_ = b.State.SetBinding(bnd)
+				}
+			}()
 		}
 	}
 
 	ctx := context.Background()
 
 	var streamErr error
-	for chunk, err := range b.SDK.AddAndGenerateTurnStream(ctx, binding.AgentID, userText, func(w string) {
-		log.Printf("⚠️ hook warning for agent %s: %s", binding.AgentID, w)
-	}) {
+	for _, err := range b.SDK.GenerateTurnStream(ctx, binding.AgentID) {
 		if err != nil {
 			streamErr = err
 			break
 		}
-		if strings.TrimSpace(chunk) != "" {
-			expandedText := ExpandScratchpadSentinels(b.SDK, binding.AgentID, chunk)
-			_ = SendAgentMessage(s, m.ChannelID, binding.AgentID, expandedText, wh)
-		}
+		// SessionWatcher is now the primary live renderer. Do not post duplicate live chunks from handler loop.
 	}
 	close(stopTyping)
 
-	// 5. Read newly generated turns, emit verbose tool logs if enabled, and update sync marker
-	allTurns, _ := b.SDK.ReadSession(binding.AgentID)
-	if len(allTurns) > 0 {
-		if binding.Verbose {
-			unsynced, _, _ := DiffUnsyncedTurns(allTurns, binding.LastTurnHash, binding.LastTurnIndex)
-			for _, turn := range unsynced {
-				toolText := FormatToolTurnSummary(turn)
-				if toolText != "" {
-					_ = SendAgentMessage(s, m.ChannelID, "Tools", toolText, nil)
-				}
-			}
-		}
-
-		if bnd := b.State.GetBinding(m.ChannelID); bnd != nil {
-			if bnd.AgentID == binding.AgentID {
-				bnd.LastTurnIndex = len(allTurns) - 1
-				bnd.LastTurnHash = ComputeTurnHash(allTurns[bnd.LastTurnIndex])
-				bnd.PendingUserHash = ""
-				bnd.PendingUserText = ""
-			} else {
-				log.Printf("⚠️ channel %s was rebound to agent %q during generation for %q; skipping sync-marker update", m.ChannelID, bnd.AgentID, binding.AgentID)
-			}
+	func() {
+		syncUnlock := b.State.LockChannelSync(m.ChannelID)
+		defer syncUnlock()
+		if bnd := b.State.GetBinding(m.ChannelID); bnd != nil && bnd.AgentID == binding.AgentID {
 			bnd.IsGenerating = false
 			if err := b.State.SetBinding(bnd); err != nil {
-				log.Printf("⚠️ failed to update binding after generation in channel %s: %v", m.ChannelID, err)
+				log.Printf("⚠️ failed to reset IsGenerating in channel %s: %v", m.ChannelID, err)
 			}
 		}
+	}()
+
+	// Synchronously call FlushNow to flush any remaining turns without waiting for 400ms trailing timer
+	if b.Watcher != nil {
+		b.Watcher.FlushNow(binding.AgentID)
 	}
 
 	if streamErr != nil {
@@ -192,23 +219,28 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 }
 
 // autoFillUnsyncedTurns replays background session turns not yet seen in Discord.
-// Caller MUST already hold the per-channel lock (via State.LockChannel) to avoid concurrency races (D76).
+// It acquires LockChannelSync(channelID) for atomic state reads and commits.
 // If limit > 0, backfills at most limit turns (or the last limit turns if fully synced).
 // Returns the number of turns backfilled and any persistence error.
 func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBinding, channelID string, limit int) (int, error) {
-	if binding == nil || binding.IsGenerating {
+	syncUnlock := b.State.LockChannelSync(channelID)
+	bnd := b.State.GetBinding(channelID)
+	if bnd == nil {
+		syncUnlock()
 		return 0, nil
 	}
 
-	turns, err := b.SDK.ReadSession(binding.AgentID)
+	turns, err := b.SDK.ReadSession(bnd.AgentID)
 	if err != nil {
+		syncUnlock()
 		return 0, fmt.Errorf("failed to read session turns: %w", err)
 	}
 	if len(turns) == 0 {
+		syncUnlock()
 		return 0, nil
 	}
 
-	unsynced, newIdx, newHash := DiffUnsyncedTurns(turns, binding.LastTurnHash, binding.LastTurnIndex)
+	unsynced, newIdx, newHash := DiffUnsyncedTurns(turns, bnd.LastTurnHash, bnd.LastTurnIndex)
 	if limit > 0 && len(unsynced) == 0 && len(turns) > 0 {
 		if limit > len(turns) {
 			limit = len(turns)
@@ -219,56 +251,121 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 	}
 
 	if len(unsynced) == 0 {
+		if bnd.LastTurnHash == "" && newHash != "" {
+			bnd.ConsumePendingUserHash(newHash)
+			bnd.LastTurnIndex = newIdx
+			bnd.LastTurnHash = newHash
+			if err := b.State.SetBinding(bnd); err != nil {
+				log.Printf("⚠️ failed to persist initial sync markers: %v", err)
+			}
+		}
+		syncUnlock()
 		return 0, nil
 	}
 
-	var wh *discordgo.Webhook
-	if binding.WebhookID != "" && binding.WebhookToken != "" {
-		wh = &discordgo.Webhook{ID: binding.WebhookID, Token: binding.WebhookToken}
+	type turnItem struct {
+		turn   *genai.Content
+		isEcho bool
 	}
+	var toProcess []turnItem
+	hasConsumedHash := false
 
 	for _, turn := range unsynced {
+		if turn == nil {
+			continue
+		}
 		if turn.Role == "user" {
 			turnHash := ComputeTurnHash(turn)
-			turnText := strings.TrimSpace(agent.ContentText(turn))
-			if (binding.PendingUserHash != "" && turnHash == binding.PendingUserHash) || (binding.PendingUserText != "" && turnText == strings.TrimSpace(binding.PendingUserText)) {
-				// This user turn was originated directly in this Discord channel! Do not echo it back.
-				binding.PendingUserHash = ""
-				binding.PendingUserText = ""
+			if bnd.ConsumePendingUserHash(turnHash) {
+				hasConsumedHash = true
+				toProcess = append(toProcess, turnItem{turn: turn, isEcho: true})
 				continue
 			}
+		}
+		toProcess = append(toProcess, turnItem{turn: turn, isEcho: false})
+	}
 
-			if binding.Verbose {
-				toolText := FormatToolTurnSummary(turn)
-				if toolText != "" {
-					_ = SendAgentMessage(s, channelID, "Tools", toolText, nil)
-				}
-			}
-
-			text := FormatUserBackfillMessage(turn)
-			if text != "" {
-				_ = SendAgentMessage(s, channelID, "User", text, nil)
-			}
-		} else {
-			if binding.Verbose {
-				toolText := FormatToolTurnSummary(turn)
-				if toolText != "" {
-					_ = SendAgentMessage(s, channelID, "Tools", toolText, nil)
-				}
-			}
-
-			text := FormatAssistantBackfillMessage(turn)
-			if text != "" {
-				text = ExpandScratchpadSentinels(b.SDK, binding.AgentID, text)
-				_ = SendAgentMessage(s, channelID, binding.AgentID, text, wh)
-			}
+	if hasConsumedHash {
+		if err := b.State.SetBinding(bnd); err != nil {
+			log.Printf("⚠️ failed to persist consumed pending user hash: %v", err)
 		}
 	}
 
-	binding.LastTurnIndex = newIdx
-	binding.LastTurnHash = newHash
-	if err := b.State.SetBinding(binding); err != nil {
-		return len(unsynced), fmt.Errorf("failed to update binding sync markers: %w", err)
+	agentID := bnd.AgentID
+	verbose := bnd.Verbose
+	whID := bnd.WebhookID
+	whToken := bnd.WebhookToken
+
+	syncUnlock()
+
+	var wh *discordgo.Webhook
+	if whID != "" && whToken != "" {
+		wh = &discordgo.Webhook{ID: whID, Token: whToken}
 	}
+
+	var toolSummaries []string
+	flushToolBatch := func() {
+		if len(toolSummaries) == 0 {
+			return
+		}
+		combined := strings.Join(toolSummaries, "\n\n")
+		toolSummaries = nil
+		chunks := SplitDiscordMessage(combined, MaxDiscordMessageLength)
+		for _, chunk := range chunks {
+			_ = SendAgentMessage(s, channelID, "Tools", chunk, nil)
+		}
+	}
+
+	for _, item := range toProcess {
+		turn := item.turn
+		if item.isEcho {
+			flushToolBatch()
+			continue
+		}
+
+		if IsSyntheticHarnessTurn(turn) {
+			flushToolBatch()
+			if verbose {
+				badge := FormatSyntheticHarnessTurn(turn)
+				if badge != "" {
+					_ = SendAgentMessage(s, channelID, "System", badge, nil)
+				}
+			}
+			continue
+		}
+
+		toolText := FormatToolTurnSummary(turn)
+		if toolText != "" && verbose {
+			toolSummaries = append(toolSummaries, toolText)
+		}
+
+		if turn.Role == "user" {
+			text := FormatUserBackfillMessage(turn)
+			if text != "" {
+				flushToolBatch()
+				_ = SendAgentMessage(s, channelID, "User", text, nil)
+			}
+		} else {
+			text := FormatAssistantBackfillMessage(turn)
+			if text != "" {
+				flushToolBatch()
+				text = ExpandScratchpadSentinels(b.SDK, agentID, text)
+				_ = SendAgentMessage(s, channelID, agentID, text, wh)
+			}
+		}
+	}
+	flushToolBatch()
+
+	syncUnlock = b.State.LockChannelSync(channelID)
+	if finalBnd := b.State.GetBinding(channelID); finalBnd != nil && finalBnd.AgentID == agentID {
+		finalBnd.LastTurnIndex = newIdx
+		finalBnd.LastTurnHash = newHash
+		if err := b.State.SetBinding(finalBnd); err != nil {
+			syncUnlock()
+			return len(unsynced), fmt.Errorf("failed to update binding sync markers: %w", err)
+		}
+	}
+	syncUnlock()
+
 	return len(unsynced), nil
 }
