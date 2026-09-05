@@ -268,7 +268,6 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		isEcho bool
 	}
 	var toProcess []turnItem
-	hasConsumedHash := false
 
 	for _, turn := range unsynced {
 		if turn == nil {
@@ -277,7 +276,6 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		if turn.Role == "user" {
 			turnHash := ComputeTurnHash(turn)
 			if bnd.ConsumePendingUserHash(turnHash) {
-				hasConsumedHash = true
 				toProcess = append(toProcess, turnItem{turn: turn, isEcho: true})
 				continue
 			}
@@ -285,10 +283,11 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		toProcess = append(toProcess, turnItem{turn: turn, isEcho: false})
 	}
 
-	if hasConsumedHash {
-		if err := b.State.SetBinding(bnd); err != nil {
-			log.Printf("⚠️ failed to persist consumed pending user hash: %v", err)
-		}
+	bnd.LastTurnIndex = newIdx
+	bnd.LastTurnHash = newHash
+	if err := b.State.SetBinding(bnd); err != nil {
+		syncUnlock()
+		return 0, fmt.Errorf("failed to update binding sync markers: %w", err)
 	}
 
 	agentID := bnd.AgentID
@@ -355,17 +354,6 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		}
 	}
 	flushToolBatch()
-
-	syncUnlock = b.State.LockChannelSync(channelID)
-	if finalBnd := b.State.GetBinding(channelID); finalBnd != nil && finalBnd.AgentID == agentID {
-		finalBnd.LastTurnIndex = newIdx
-		finalBnd.LastTurnHash = newHash
-		if err := b.State.SetBinding(finalBnd); err != nil {
-			syncUnlock()
-			return len(unsynced), fmt.Errorf("failed to update binding sync markers: %w", err)
-		}
-	}
-	syncUnlock()
 
 	return len(unsynced), nil
 }

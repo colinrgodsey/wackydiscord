@@ -64,6 +64,7 @@ type State struct {
 	chanLocksMu sync.Mutex
 	chanSyncMu  map[string]*sync.Mutex
 	chanTurnMu  map[string]*sync.Mutex
+	chanDrainMu map[string]*sync.Mutex
 	filePath    string
 	Bindings    map[string]*ChannelBinding `json:"bindings"`
 }
@@ -71,10 +72,11 @@ type State struct {
 // NewState loads or initializes state from the specified JSON file.
 func NewState(filePath string) (*State, error) {
 	s := &State{
-		filePath:   filePath,
-		Bindings:   make(map[string]*ChannelBinding),
-		chanSyncMu: make(map[string]*sync.Mutex),
-		chanTurnMu: make(map[string]*sync.Mutex),
+		filePath:    filePath,
+		Bindings:    make(map[string]*ChannelBinding),
+		chanSyncMu:  make(map[string]*sync.Mutex),
+		chanTurnMu:  make(map[string]*sync.Mutex),
+		chanDrainMu: make(map[string]*sync.Mutex),
 	}
 
 	if data, err := os.ReadFile(filePath); err == nil {
@@ -127,6 +129,26 @@ func (s *State) LockChannelSync(channelID string) func() {
 	if !ok {
 		mu = &sync.Mutex{}
 		s.chanSyncMu[channelID] = mu
+	}
+	s.chanLocksMu.Unlock()
+
+	mu.Lock()
+	return func() {
+		mu.Unlock()
+	}
+}
+
+// LockChannelDrain acquires the send-drain mutex for the specified channelID.
+// It serializes Discord message sending across concurrent sync passes.
+func (s *State) LockChannelDrain(channelID string) func() {
+	s.chanLocksMu.Lock()
+	if s.chanDrainMu == nil {
+		s.chanDrainMu = make(map[string]*sync.Mutex)
+	}
+	mu, ok := s.chanDrainMu[channelID]
+	if !ok {
+		mu = &sync.Mutex{}
+		s.chanDrainMu[channelID] = mu
 	}
 	s.chanLocksMu.Unlock()
 

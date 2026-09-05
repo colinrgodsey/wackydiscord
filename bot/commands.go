@@ -103,9 +103,6 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	turnUnlock := b.State.LockChannelTurn(i.ChannelID)
 	defer turnUnlock()
 
-	syncUnlock := b.State.LockChannelSync(i.ChannelID)
-	defer syncUnlock()
-
 	agentID := ""
 	for _, opt := range i.ApplicationCommandData().Options {
 		if opt.Name == "agent" {
@@ -165,7 +162,10 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		WebhookToken:  whToken,
 	}
 
-	if err := b.State.SetBinding(binding); err != nil {
+	syncUnlock := b.State.LockChannelSync(i.ChannelID)
+	err = b.State.SetBinding(binding)
+	syncUnlock()
+	if err != nil {
 		b.respondInteraction(s, i, fmt.Sprintf("❌ Failed to save binding: %v", err), true)
 		return
 	}

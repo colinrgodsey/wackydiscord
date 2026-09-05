@@ -159,9 +159,13 @@ func (b *Bot) SyncAgentToChannels(agentID string) {
 	bindings := b.State.GetAllBindings()
 	for _, binding := range bindings {
 		if binding.AgentID == agentID {
-			if _, err := b.autoFillUnsyncedTurns(b.Session, nil, binding.ChannelID, 0); err != nil {
-				log.Printf("⚠️ background auto-sync error for agent %s in channel %s: %v", agentID, binding.ChannelID, err)
-			}
+			func() {
+				drainUnlock := b.State.LockChannelDrain(binding.ChannelID)
+				defer drainUnlock()
+				if _, err := b.autoFillUnsyncedTurns(b.Session, nil, binding.ChannelID, 0); err != nil {
+					log.Printf("⚠️ background auto-sync error for agent %s in channel %s: %v", agentID, binding.ChannelID, err)
+				}
+			}()
 		}
 	}
 }

@@ -208,6 +208,49 @@ func TestState_LockChannel(t *testing.T) {
 	unlockSync := st.LockChannelSync("chan_d")
 	unlockTurn()
 	unlockSync()
+
+	// 5. Lazy creation & unlock execution for LockChannelDrain
+	unlockDrain := st.LockChannelDrain("chan_e")
+	if unlockDrain == nil {
+		t.Fatal("expected non-nil drain unlock function")
+	}
+	unlockDrain()
+
+	// 6. Decoupled locks: LockChannelTurn, LockChannelSync, and LockChannelDrain can be acquired concurrently
+	unlockTurn = st.LockChannelTurn("chan_f")
+	unlockSync = st.LockChannelSync("chan_f")
+	unlockDrain = st.LockChannelDrain("chan_f")
+	unlockTurn()
+	unlockSync()
+	unlockDrain()
+
+	// 7. LockChannelDrain blocks concurrently on same channel
+	drainLocked := make(chan struct{})
+	drainUnlocked := make(chan struct{})
+	drainDone := make(chan struct{})
+
+	drainMain := st.LockChannelDrain("chan_g")
+	go func() {
+		close(drainLocked)
+		drainSecond := st.LockChannelDrain("chan_g")
+		close(drainUnlocked)
+		drainSecond()
+		close(drainDone)
+	}()
+
+	<-drainLocked
+	select {
+	case <-drainUnlocked:
+		t.Fatal("second LockChannelDrain should have blocked while chan_g was held")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	drainMain()
+	select {
+	case <-drainDone:
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for second LockChannelDrain to acquire lock after unlock")
+	}
 }
 
 func TestComputeTurnHash(t *testing.T) {
@@ -971,6 +1014,82 @@ func TestHandleUnbindCommand_Locking(t *testing.T) {
 	// Verify binding was removed
 	if st.GetBinding("chan_unbind_lock") != nil {
 		t.Errorf("expected chan_unbind_lock to be removed")
+	}
+}
+
+func TestHandleBindCommand_Locking(t *testing.T) {
+	tmpDir := t.TempDir()
+	markerPath := filepath.Join(tmpDir, "WACKYPUB_ROOT")
+	if err := os.WriteFile(markerPath, []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write WACKYPUB_ROOT: %v", err)
+	}
+
+	bobDir := filepath.Join(tmpDir, "bob")
+	if err := os.MkdirAll(bobDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bobDir, "AGENTS.md"), []byte("Prompt"), 0644); err != nil {
+		t.Fatalf("failed writing AGENTS.md: %v", err)
+	}
+
+	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
+	st, err := NewState(stateFile)
+	if err != nil {
+		t.Fatalf("NewState failed: %v", err)
+	}
+
+	b := &Bot{
+		WsDir: tmpDir,
+		State: st,
+		SDK:   agent.NewSDK(tmpDir),
+	}
+
+	// 1. handleBindCommand blocks when LockChannelTurn is held
+	channelID := "chan_bind_lock"
+	turnUnlock := st.LockChannelTurn(channelID)
+
+	lockAcquiredByBind := make(chan struct{})
+	go func() {
+		b.handleBindCommand(nil, &discordgo.InteractionCreate{
+			Interaction: &discordgo.Interaction{
+				ChannelID: channelID,
+				Type:      discordgo.InteractionApplicationCommand,
+				Data: discordgo.ApplicationCommandInteractionData{
+					Options: []*discordgo.ApplicationCommandInteractionDataOption{
+						{
+							Name:  "agent",
+							Value: "bob",
+							Type:  discordgo.ApplicationCommandOptionString,
+						},
+					},
+				},
+			},
+		})
+		close(lockAcquiredByBind)
+	}()
+
+	select {
+	case <-lockAcquiredByBind:
+		t.Fatal("handleBindCommand should have blocked while LockChannelTurn was held")
+	case <-time.After(50 * time.Millisecond):
+		// Expected to be blocked on LockChannelTurn
+	}
+
+	// LockChannelSync should NOT be blocked while handleBindCommand is waiting on LockChannelTurn
+	syncUnlock := st.LockChannelSync(channelID)
+	syncUnlock()
+
+	turnUnlock()
+
+	select {
+	case <-lockAcquiredByBind:
+		// Succeeded
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for handleBindCommand after unlocking LockChannelTurn")
+	}
+
+	if st.GetBinding(channelID) == nil {
+		t.Errorf("expected %s to be bound to bob", channelID)
 	}
 }
 

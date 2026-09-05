@@ -521,3 +521,119 @@ func TestWatcher_SyntheticContinuationTurns(t *testing.T) {
 		t.Errorf("unexpected synthetic status badge: %q", msgs[0])
 	}
 }
+
+// 7. Test that concurrent sync (e.g. FlushNow while leading-edge sync is sending HTTP messages)
+// does not echo the user message or double-render assistant output.
+func TestWatcher_ConcurrentSyncDoesNotEchoOrDoubleRender(t *testing.T) {
+	b, agentDir, st := setupTestBot(t, "concurrent_agent")
+
+	var mu sync.Mutex
+	var sentMessages []string
+	sendStarted := make(chan struct{})
+	allowSendFinish := make(chan struct{})
+
+	s, _ := discordgo.New("Bot fake-token")
+	s.Client.Transport = fakeRoundTripper(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		var payload struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(body, &payload); err == nil && payload.Content != "" {
+			mu.Lock()
+			sentMessages = append(sentMessages, payload.Content)
+			mu.Unlock()
+		}
+
+		select {
+		case sendStarted <- struct{}{}:
+		default:
+		}
+		<-allowSendFinish
+
+		return &http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(`{"id":"msg_1"}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	b.Session = s
+
+	channelID := "chan_concurrent"
+	initTurn := genai.NewContentFromText("System init", "user")
+	if err := agent.AppendSessionContent(agentDir, initTurn); err != nil {
+		t.Fatalf("AppendSessionContent initTurn failed: %v", err)
+	}
+	initHash := ComputeTurnHash(initTurn)
+
+	userMsgText := "Calculate the warp trajectory."
+	userTurn := genai.NewContentFromText(userMsgText, "user")
+	if err := agent.AppendSessionContent(agentDir, userTurn); err != nil {
+		t.Fatalf("AppendSessionContent userTurn failed: %v", err)
+	}
+	userHash := ComputeTurnHash(userTurn)
+
+	modelTurn := genai.NewContentFromText("Trajectory calculated.", "model")
+	if err := agent.AppendSessionContent(agentDir, modelTurn); err != nil {
+		t.Fatalf("AppendSessionContent modelTurn failed: %v", err)
+	}
+
+	binding := &ChannelBinding{
+		ChannelID:     channelID,
+		AgentID:       "concurrent_agent",
+		LastTurnIndex: 0,
+		LastTurnHash:  initHash,
+	}
+	binding.AddPendingUserHash(userHash)
+	if err := st.SetBinding(binding); err != nil {
+		t.Fatalf("SetBinding failed: %v", err)
+	}
+
+	// Start first sync in background (simulating leading edge)
+	firstSyncDone := make(chan struct{})
+	go func() {
+		b.SyncAgentToChannels("concurrent_agent")
+		close(firstSyncDone)
+	}()
+
+	// Wait until first sync is in HTTP send phase
+	select {
+	case <-sendStarted:
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for first sync to reach send phase")
+	}
+
+	// While first sync is sending, trigger a concurrent sync (e.g. FlushNow)
+	secondSyncDone := make(chan struct{})
+	go func() {
+		b.SyncAgentToChannels("concurrent_agent")
+		close(secondSyncDone)
+	}()
+
+	// Release the HTTP send
+	close(allowSendFinish)
+
+	<-firstSyncDone
+	<-secondSyncDone
+
+	mu.Lock()
+	msgs := append([]string{}, sentMessages...)
+	mu.Unlock()
+
+	// Verify no user turn echo
+	for _, m := range msgs {
+		if strings.Contains(m, userMsgText) {
+			t.Errorf("user message was echoed back to Discord: %q", m)
+		}
+	}
+
+	// Verify assistant output was sent exactly once
+	modelMsgCount := 0
+	for _, m := range msgs {
+		if strings.Contains(m, "Trajectory calculated.") {
+			modelMsgCount++
+		}
+	}
+	if modelMsgCount != 1 {
+		t.Errorf("expected assistant output to be rendered exactly once, got %d times (msgs: %v)", modelMsgCount, msgs)
+	}
+}
