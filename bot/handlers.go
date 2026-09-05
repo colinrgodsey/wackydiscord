@@ -1,13 +1,10 @@
 package bot
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"strings"
 	"time"
 
@@ -59,23 +56,29 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		return
 	}
 
-	// If image attachments exist, process them
 	if len(m.Attachments) > 0 {
-		for _, att := range m.Attachments {
-			if att == nil || att.URL == "" {
-				continue
+		attCtx, cancel := context.WithTimeout(context.Background(), TotalAttachmentBudget)
+		defer cancel()
+
+		attResult, _ := b.ProcessAttachments(attCtx, binding.AgentID, m.Attachments)
+		if attResult != nil {
+			for _, notice := range attResult.Notices {
+				_ = SendAgentMessage(s, m.ChannelID, "System", notice, nil)
 			}
-			// If image, download and append as media turn
-			if strings.HasPrefix(att.ContentType, "image/") || strings.HasSuffix(strings.ToLower(att.Filename), ".png") || strings.HasSuffix(strings.ToLower(att.Filename), ".jpg") || strings.HasSuffix(strings.ToLower(att.Filename), ".jpeg") {
-				if imgBytes, err := downloadAttachment(att.URL); err == nil && len(imgBytes) > 0 {
-					_, _ = b.SDK.AddMedia(binding.AgentID, bytes.NewReader(imgBytes))
+			if attResult.PromptText != "" {
+				if userText != "" {
+					userText = userText + "\n\n" + attResult.PromptText
+				} else {
+					userText = attResult.PromptText
 				}
+			} else if userText == "" && attResult.ImagesDownloaded > 0 {
+				userText = "[User attached image]"
 			}
 		}
 	}
 
 	if userText == "" {
-		userText = "[User attached image]"
+		return
 	}
 
 	// 3. Mark channel as actively generating to prevent file watcher race & echoes
@@ -268,19 +271,4 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		return len(unsynced), fmt.Errorf("failed to update binding sync markers: %w", err)
 	}
 	return len(unsynced), nil
-}
-
-func downloadAttachment(url string) ([]byte, error) {
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("bad status downloading attachment: %s", resp.Status)
-	}
-
-	return io.ReadAll(resp.Body)
 }
