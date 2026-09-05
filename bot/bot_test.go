@@ -157,16 +157,16 @@ func TestState_LockChannel(t *testing.T) {
 		t.Fatalf("NewState failed: %v", err)
 	}
 
-	// 1. Lazy creation & unlock execution
-	unlock1 := st.LockChannel("chan_a")
+	// 1. Lazy creation & unlock execution for LockChannelSync
+	unlock1 := st.LockChannelSync("chan_a")
 	if unlock1 == nil {
 		t.Fatal("expected non-nil unlock function")
 	}
 	unlock1()
 
 	// 2. Different channels get independent locks and can be acquired concurrently
-	unlockA := st.LockChannel("chan_a")
-	unlockB := st.LockChannel("chan_b")
+	unlockA := st.LockChannelSync("chan_a")
+	unlockB := st.LockChannelSync("chan_b")
 
 	// Both chan_a and chan_b held simultaneously without deadlock
 	unlockA()
@@ -177,10 +177,10 @@ func TestState_LockChannel(t *testing.T) {
 	unlocked := make(chan struct{})
 	done := make(chan struct{})
 
-	unlockMain := st.LockChannel("chan_c")
+	unlockMain := st.LockChannelSync("chan_c")
 	go func() {
 		close(locked)
-		unlockSecond := st.LockChannel("chan_c")
+		unlockSecond := st.LockChannelSync("chan_c")
 		close(unlocked)
 		unlockSecond()
 		close(done)
@@ -189,7 +189,7 @@ func TestState_LockChannel(t *testing.T) {
 	<-locked
 	select {
 	case <-unlocked:
-		t.Fatal("second LockChannel should have blocked while chan_c was held")
+		t.Fatal("second LockChannelSync should have blocked while chan_c was held")
 	case <-time.After(50 * time.Millisecond):
 		// Expected to still be blocked
 	}
@@ -200,7 +200,56 @@ func TestState_LockChannel(t *testing.T) {
 	case <-done:
 		// Succeeded
 	case <-time.After(1 * time.Second):
-		t.Fatal("timed out waiting for second LockChannel to acquire lock after unlock")
+		t.Fatal("timed out waiting for second LockChannelSync to acquire lock after unlock")
+	}
+
+	// 4. Decoupled locks: LockChannelTurn and LockChannelSync for the same channel can be acquired concurrently
+	unlockTurn := st.LockChannelTurn("chan_d")
+	unlockSync := st.LockChannelSync("chan_d")
+	unlockTurn()
+	unlockSync()
+
+	// 5. Lazy creation & unlock execution for LockChannelDrain
+	unlockDrain := st.LockChannelDrain("chan_e")
+	if unlockDrain == nil {
+		t.Fatal("expected non-nil drain unlock function")
+	}
+	unlockDrain()
+
+	// 6. Decoupled locks: LockChannelTurn, LockChannelSync, and LockChannelDrain can be acquired concurrently
+	unlockTurn = st.LockChannelTurn("chan_f")
+	unlockSync = st.LockChannelSync("chan_f")
+	unlockDrain = st.LockChannelDrain("chan_f")
+	unlockTurn()
+	unlockSync()
+	unlockDrain()
+
+	// 7. LockChannelDrain blocks concurrently on same channel
+	drainLocked := make(chan struct{})
+	drainUnlocked := make(chan struct{})
+	drainDone := make(chan struct{})
+
+	drainMain := st.LockChannelDrain("chan_g")
+	go func() {
+		close(drainLocked)
+		drainSecond := st.LockChannelDrain("chan_g")
+		close(drainUnlocked)
+		drainSecond()
+		close(drainDone)
+	}()
+
+	<-drainLocked
+	select {
+	case <-drainUnlocked:
+		t.Fatal("second LockChannelDrain should have blocked while chan_g was held")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	drainMain()
+	select {
+	case <-drainDone:
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for second LockChannelDrain to acquire lock after unlock")
 	}
 }
 
@@ -513,13 +562,12 @@ func TestPendingUserEchoSuppression(t *testing.T) {
 	userHash := ComputeTurnHash(userTurn)
 
 	binding := &ChannelBinding{
-		ChannelID:       "chan_10",
-		AgentID:         "bob",
-		PendingUserHash: userHash,
-		PendingUserText: userMsg,
-		LastTurnIndex:   0,
-		LastTurnHash:    prevHash,
+		ChannelID:     "chan_10",
+		AgentID:       "bob",
+		LastTurnIndex: 0,
+		LastTurnHash:  prevHash,
 	}
+	binding.AddPendingUserHash(userHash)
 
 	turns := []*genai.Content{prevTurn, userTurn}
 	unsynced, _, _ := DiffUnsyncedTurns(turns, binding.LastTurnHash, binding.LastTurnIndex)
@@ -527,10 +575,13 @@ func TestPendingUserEchoSuppression(t *testing.T) {
 		t.Fatalf("expected 1 unsynced turn, got %d", len(unsynced))
 	}
 
-	// Verify matching
+	// Verify matching and consumption
 	turnHash := ComputeTurnHash(unsynced[0])
-	if turnHash != binding.PendingUserHash {
-		t.Errorf("expected turnHash to match PendingUserHash")
+	if !binding.ConsumePendingUserHash(turnHash) {
+		t.Errorf("expected turnHash to match and be consumed from PendingUserHashes")
+	}
+	if binding.ConsumePendingUserHash(turnHash) {
+		t.Errorf("expected second consumption of same turnHash to fail")
 	}
 }
 
@@ -668,7 +719,7 @@ func TestHandleMessageCreate_UnbindingRaceAndNilCheck(t *testing.T) {
 		AgentID:   "bob",
 	})
 
-	unlock := st.LockChannel("chan_race")
+	unlock := st.LockChannelTurn("chan_race")
 	done := make(chan struct{})
 
 	go func() {
@@ -766,10 +817,7 @@ func TestAutoFillUnsyncedTurns_Limit(t *testing.T) {
 	}
 	_ = st.SetBinding(binding)
 
-	unlock := st.LockChannel("chan_test")
 	count, err := b.autoFillUnsyncedTurns(nil, binding, "chan_test", 2)
-	unlock()
-
 	if err != nil {
 		t.Fatalf("autoFillUnsyncedTurns failed: %v", err)
 	}
@@ -782,10 +830,7 @@ func TestAutoFillUnsyncedTurns_Limit(t *testing.T) {
 	binding.LastTurnHash = ""
 	_ = st.SetBinding(binding)
 
-	unlock = st.LockChannel("chan_test")
 	count, err = b.autoFillUnsyncedTurns(nil, binding, "chan_test", 10)
-	unlock()
-
 	if err != nil {
 		t.Fatalf("autoFillUnsyncedTurns failed: %v", err)
 	}
@@ -793,19 +838,18 @@ func TestAutoFillUnsyncedTurns_Limit(t *testing.T) {
 		t.Errorf("expected 4 turns backfilled when limit exceeds count, got %d", count)
 	}
 
-	// 3. Skip when IsGenerating is true
+	// 3. Under D89, autoFillUnsyncedTurns does NOT block when IsGenerating is true
+	binding.LastTurnIndex = 1
+	binding.LastTurnHash = ComputeTurnHash(t2)
 	binding.IsGenerating = true
 	_ = st.SetBinding(binding)
 
-	unlock = st.LockChannel("chan_test")
 	count, err = b.autoFillUnsyncedTurns(nil, binding, "chan_test", 0)
-	unlock()
-
 	if err != nil {
 		t.Fatalf("autoFillUnsyncedTurns with IsGenerating true failed: %v", err)
 	}
-	if count != 0 {
-		t.Errorf("expected 0 turns backfilled when IsGenerating is true, got %d", count)
+	if count != 2 {
+		t.Errorf("expected 2 turns backfilled when IsGenerating is true under D89, got %d", count)
 	}
 }
 
@@ -866,7 +910,7 @@ func TestHandleFillCommand_Locking(t *testing.T) {
 		AgentID:   "bob",
 	})
 
-	unlock := st.LockChannel("chan_lock_test")
+	unlock := st.LockChannelSync("chan_lock_test")
 	lockAcquiredByFill := make(chan struct{})
 	go func() {
 		b.handleFillCommand(nil, &discordgo.InteractionCreate{
@@ -938,7 +982,7 @@ func TestHandleUnbindCommand_Locking(t *testing.T) {
 		AgentID:   "bob",
 	})
 
-	unlock := st.LockChannel("chan_unbind_lock")
+	unlock := st.LockChannelTurn("chan_unbind_lock")
 	lockAcquiredByUnbind := make(chan struct{})
 	go func() {
 		b.handleUnbindCommand(nil, &discordgo.InteractionCreate{
@@ -970,6 +1014,82 @@ func TestHandleUnbindCommand_Locking(t *testing.T) {
 	// Verify binding was removed
 	if st.GetBinding("chan_unbind_lock") != nil {
 		t.Errorf("expected chan_unbind_lock to be removed")
+	}
+}
+
+func TestHandleBindCommand_Locking(t *testing.T) {
+	tmpDir := t.TempDir()
+	markerPath := filepath.Join(tmpDir, "WACKYPUB_ROOT")
+	if err := os.WriteFile(markerPath, []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write WACKYPUB_ROOT: %v", err)
+	}
+
+	bobDir := filepath.Join(tmpDir, "bob")
+	if err := os.MkdirAll(bobDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bobDir, "AGENTS.md"), []byte("Prompt"), 0644); err != nil {
+		t.Fatalf("failed writing AGENTS.md: %v", err)
+	}
+
+	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
+	st, err := NewState(stateFile)
+	if err != nil {
+		t.Fatalf("NewState failed: %v", err)
+	}
+
+	b := &Bot{
+		WsDir: tmpDir,
+		State: st,
+		SDK:   agent.NewSDK(tmpDir),
+	}
+
+	// 1. handleBindCommand blocks when LockChannelTurn is held
+	channelID := "chan_bind_lock"
+	turnUnlock := st.LockChannelTurn(channelID)
+
+	lockAcquiredByBind := make(chan struct{})
+	go func() {
+		b.handleBindCommand(nil, &discordgo.InteractionCreate{
+			Interaction: &discordgo.Interaction{
+				ChannelID: channelID,
+				Type:      discordgo.InteractionApplicationCommand,
+				Data: discordgo.ApplicationCommandInteractionData{
+					Options: []*discordgo.ApplicationCommandInteractionDataOption{
+						{
+							Name:  "agent",
+							Value: "bob",
+							Type:  discordgo.ApplicationCommandOptionString,
+						},
+					},
+				},
+			},
+		})
+		close(lockAcquiredByBind)
+	}()
+
+	select {
+	case <-lockAcquiredByBind:
+		t.Fatal("handleBindCommand should have blocked while LockChannelTurn was held")
+	case <-time.After(50 * time.Millisecond):
+		// Expected to be blocked on LockChannelTurn
+	}
+
+	// LockChannelSync should NOT be blocked while handleBindCommand is waiting on LockChannelTurn
+	syncUnlock := st.LockChannelSync(channelID)
+	syncUnlock()
+
+	turnUnlock()
+
+	select {
+	case <-lockAcquiredByBind:
+		// Succeeded
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for handleBindCommand after unlocking LockChannelTurn")
+	}
+
+	if st.GetBinding(channelID) == nil {
+		t.Errorf("expected %s to be bound to bob", channelID)
 	}
 }
 

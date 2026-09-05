@@ -100,7 +100,9 @@ func (b *Bot) HandleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 }
 
 func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	// TODO(fast-follow): Acquire State.LockChannel(i.ChannelID) to serialize binding creation with in-flight operations.
+	turnUnlock := b.State.LockChannelTurn(i.ChannelID)
+	defer turnUnlock()
+
 	agentID := ""
 	for _, opt := range i.ApplicationCommandData().Options {
 		if opt.Name == "agent" {
@@ -160,7 +162,10 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		WebhookToken:  whToken,
 	}
 
-	if err := b.State.SetBinding(binding); err != nil {
+	syncUnlock := b.State.LockChannelSync(i.ChannelID)
+	err = b.State.SetBinding(binding)
+	syncUnlock()
+	if err != nil {
 		b.respondInteraction(s, i, fmt.Sprintf("❌ Failed to save binding: %v", err), true)
 		return
 	}
@@ -179,8 +184,11 @@ func (b *Bot) handleUnbindCommand(s *discordgo.Session, i *discordgo.Interaction
 		return
 	}
 
-	unlock := b.State.LockChannel(i.ChannelID)
-	defer unlock()
+	turnUnlock := b.State.LockChannelTurn(i.ChannelID)
+	defer turnUnlock()
+
+	syncUnlock := b.State.LockChannelSync(i.ChannelID)
+	defer syncUnlock()
 
 	binding := b.State.GetBinding(i.ChannelID)
 	if binding == nil {
@@ -270,19 +278,20 @@ func (b *Bot) handleFillCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		})
 	}
 
-	unlock := b.State.LockChannel(i.ChannelID)
-	defer unlock()
-
+	syncUnlock := b.State.LockChannelSync(i.ChannelID)
 	binding := b.State.GetBinding(i.ChannelID)
 	if binding == nil {
+		syncUnlock()
 		b.editInteractionResponse(s, i, "❌ This channel is not bound to any agent. Use `/bind <agent_id>` first.")
 		return
 	}
 
 	if binding.IsGenerating {
+		syncUnlock()
 		b.editInteractionResponse(s, i, "⚠️ Agent is currently generating; please wait for generation to complete before running `/fill`.")
 		return
 	}
+	syncUnlock()
 
 	insp, err := b.SDK.InspectAgent(binding.AgentID)
 	if err != nil || insp == nil || !insp.AgentDirExists {
@@ -314,7 +323,9 @@ func (b *Bot) handleFillCommand(s *discordgo.Session, i *discordgo.InteractionCr
 }
 
 func (b *Bot) handleVerboseCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	// TODO(fast-follow): Acquire State.LockChannel(i.ChannelID) to serialize verbose toggle with concurrent message handlers.
+	syncUnlock := b.State.LockChannelSync(i.ChannelID)
+	defer syncUnlock()
+
 	binding := b.State.GetBinding(i.ChannelID)
 	if binding == nil {
 		b.respondInteraction(s, i, "❌ This channel is not bound to any agent. Use `/bind <agent_id>` first.", true)

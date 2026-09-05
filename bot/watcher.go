@@ -12,18 +12,30 @@ import (
 )
 
 const (
-	// DefaultDebounceDuration is the quiet window before syncing session turns to Discord.
-	DefaultDebounceDuration = 300 * time.Millisecond
+	// TrailingDebounceDuration is the quiet window before syncing session turns to Discord.
+	TrailingDebounceDuration = 400 * time.Millisecond
+
+	// MaxWaitDebounceDuration is the hard ceiling before forcing a sync pass.
+	MaxWaitDebounceDuration = 1200 * time.Millisecond
+
+	// DefaultDebounceDuration is kept for backwards compatibility.
+	DefaultDebounceDuration = TrailingDebounceDuration
 )
+
+type debounceTracker struct {
+	timer        *time.Timer // Trailing quiet-window timer (400ms)
+	maxTimer     *time.Timer // Hard max-wait ceiling timer (1200ms)
+	firstEventAt time.Time
+}
 
 // SessionWatcher monitors agent directories for session.jsonl modifications and triggers real-time backfill.
 type SessionWatcher struct {
-	mu             sync.Mutex
-	bot            *Bot
-	watcher        *fsnotify.Watcher
-	watchedDirs    map[string]bool
-	debounceTimers map[string]*time.Timer
-	stopCh         chan struct{}
+	mu          sync.Mutex
+	bot         *Bot
+	watcher     *fsnotify.Watcher
+	watchedDirs map[string]bool
+	trackers    map[string]*debounceTracker
+	stopCh      chan struct{}
 }
 
 // NewSessionWatcher creates a new SessionWatcher for the provided bot.
@@ -34,11 +46,11 @@ func NewSessionWatcher(b *Bot) (*SessionWatcher, error) {
 	}
 
 	sw := &SessionWatcher{
-		bot:            b,
-		watcher:        fw,
-		watchedDirs:    make(map[string]bool),
-		debounceTimers: make(map[string]*time.Timer),
-		stopCh:         make(chan struct{}),
+		bot:         b,
+		watcher:     fw,
+		watchedDirs: make(map[string]bool),
+		trackers:    make(map[string]*debounceTracker),
+		stopCh:      make(chan struct{}),
 	}
 
 	return sw, nil
@@ -98,6 +110,16 @@ func (sw *SessionWatcher) UnwatchAgent(agentID string) {
 		}
 	}
 
+	if tr, exists := sw.trackers[agentID]; exists {
+		if tr.timer != nil {
+			tr.timer.Stop()
+		}
+		if tr.maxTimer != nil {
+			tr.maxTimer.Stop()
+		}
+		delete(sw.trackers, agentID)
+	}
+
 	_ = sw.watcher.Remove(agentDir)
 	delete(sw.watchedDirs, agentDir)
 	log.Printf("Unwatched agent directory: %s", agentDir)
@@ -115,8 +137,13 @@ func (sw *SessionWatcher) Close() error {
 		close(sw.stopCh)
 	}
 
-	for _, t := range sw.debounceTimers {
-		t.Stop()
+	for _, tr := range sw.trackers {
+		if tr.timer != nil {
+			tr.timer.Stop()
+		}
+		if tr.maxTimer != nil {
+			tr.maxTimer.Stop()
+		}
 	}
 
 	return sw.watcher.Close()
@@ -158,11 +185,59 @@ func (sw *SessionWatcher) debounceAgentSync(agentID string) {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 
-	if timer, exists := sw.debounceTimers[agentID]; exists {
-		timer.Stop()
+	tr, exists := sw.trackers[agentID]
+	if !exists {
+		// Leading edge: Execute sync immediately for the first event
+		go sw.bot.SyncAgentToChannels(agentID)
+
+		tr = &debounceTracker{
+			firstEventAt: time.Now(),
+		}
+		// Start hard ceiling timer (1200ms)
+		tr.maxTimer = time.AfterFunc(MaxWaitDebounceDuration, func() {
+			sw.flushAgentSync(agentID)
+		})
+		sw.trackers[agentID] = tr
 	}
 
-	sw.debounceTimers[agentID] = time.AfterFunc(DefaultDebounceDuration, func() {
-		sw.bot.SyncAgentToChannels(agentID)
+	// Reset trailing quiet timer (400ms)
+	if tr.timer != nil {
+		tr.timer.Stop()
+	}
+	tr.timer = time.AfterFunc(TrailingDebounceDuration, func() {
+		sw.flushAgentSync(agentID)
 	})
+}
+
+func (sw *SessionWatcher) flushAgentSync(agentID string) {
+	sw.mu.Lock()
+	if tr, exists := sw.trackers[agentID]; exists {
+		if tr.timer != nil {
+			tr.timer.Stop()
+		}
+		if tr.maxTimer != nil {
+			tr.maxTimer.Stop()
+		}
+		delete(sw.trackers, agentID)
+	}
+	sw.mu.Unlock()
+
+	sw.bot.SyncAgentToChannels(agentID)
+}
+
+// FlushNow cancels pending debounce timers for agentID and synchronously calls SyncAgentToChannels immediately.
+func (sw *SessionWatcher) FlushNow(agentID string) {
+	sw.mu.Lock()
+	if tr, exists := sw.trackers[agentID]; exists {
+		if tr.timer != nil {
+			tr.timer.Stop()
+		}
+		if tr.maxTimer != nil {
+			tr.maxTimer.Stop()
+		}
+		delete(sw.trackers, agentID)
+	}
+	sw.mu.Unlock()
+
+	sw.bot.SyncAgentToChannels(agentID)
 }
