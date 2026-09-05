@@ -67,6 +67,9 @@ func SendAgentMessage(s *discordgo.Session, channelID string, agentID string, co
 			params := &discordgo.WebhookParams{
 				Content:  chunk,
 				Username: username,
+				AllowedMentions: &discordgo.MessageAllowedMentions{
+					Parse: []discordgo.AllowedMentionType{},
+				},
 			}
 			_, err := s.WebhookExecute(webhook.ID, webhook.Token, true, params)
 			if err == nil {
@@ -76,7 +79,13 @@ func SendAgentMessage(s *discordgo.Session, channelID string, agentID string, co
 
 		if !sent {
 			// Fallback to standard message send
-			if _, err := s.ChannelMessageSend(channelID, chunk); err != nil {
+			msg := &discordgo.MessageSend{
+				Content: chunk,
+				AllowedMentions: &discordgo.MessageAllowedMentions{
+					Parse: []discordgo.AllowedMentionType{},
+				},
+			}
+			if _, err := s.ChannelMessageSendComplex(channelID, msg); err != nil {
 				return fmt.Errorf("failed to send message to channel %s: %w", channelID, err)
 			}
 		}

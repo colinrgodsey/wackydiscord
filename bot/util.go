@@ -1,10 +1,38 @@
 package bot
 
-import "strings"
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+)
 
 const (
 	// MaxDiscordMessageLength is the maximum character limit for a single Discord message.
 	MaxDiscordMessageLength = 2000
+
+	// MaxAttachmentBytes is the hard cap for attachment downloads (20MB).
+	MaxAttachmentBytes = 20 * 1024 * 1024
+
+	// MaxInlineTextBytes is the maximum byte size for inlining a text attachment into prompt text (100KB).
+	MaxInlineTextBytes = 100 * 1024
+
+	// MaxAttachmentsPerMessage is the maximum number of attachments processed per message turn.
+	MaxAttachmentsPerMessage = 5
+
+	// AttachmentDownloadTimeout is the per-file timeout for downloading an attachment.
+	AttachmentDownloadTimeout = 10 * time.Second
+
+	// TotalAttachmentBudget is the maximum cumulative time allowed for downloading all attachments in a message.
+	TotalAttachmentBudget = 30 * time.Second
+)
+
+var (
+	// ErrAttachmentTooLarge is returned when an attachment exceeds the 20MB limit.
+	ErrAttachmentTooLarge = errors.New("attachment exceeds maximum allowed size of 20MB")
 )
 
 // SplitDiscordMessage splits long text into chunks that fit within Discord's 2000-character limit.
@@ -65,4 +93,51 @@ func SplitDiscordMessage(content string, maxLen ...int) []string {
 	}
 
 	return chunks
+}
+
+// downloadAttachment downloads an attachment from url using an io.LimitReader capped at maxBytes+1.
+// If maxBytes <= 0, defaults to MaxAttachmentBytes (20MB).
+// Returns ErrAttachmentTooLarge if the downloaded content exceeds maxBytes.
+// Enforces a 10-second per-file timeout, bounded by any deadline on ctx.
+func downloadAttachment(ctx context.Context, url string, maxBytes ...int64) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	limit := int64(MaxAttachmentBytes)
+	if len(maxBytes) > 0 && maxBytes[0] > 0 {
+		limit = maxBytes[0]
+	}
+
+	fileCtx, cancel := context.WithTimeout(ctx, AttachmentDownloadTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(fileCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bad status downloading attachment: %s", resp.Status)
+	}
+
+	if resp.ContentLength > limit {
+		return nil, ErrAttachmentTooLarge
+	}
+
+	lr := io.LimitReader(resp.Body, limit+1)
+	data, err := io.ReadAll(lr)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, ErrAttachmentTooLarge
+	}
+	return data, nil
 }
