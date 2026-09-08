@@ -316,13 +316,14 @@ func (s *State) DefaultOpen() bool {
 
 // TryClaim attempts to claim ownership of the bot instance for the given user ID.
 // If the bot is unclaimed, the claim succeeds and is persisted to disk.
-// If the bot is already claimed by userID, it returns (true, userID) idempotently.
-// If the bot is claimed by another user, it returns (false, owner) without mutating state.
-func (s *State) TryClaim(userID string) (ok bool, owner string) {
+// If the bot is already claimed by userID, it returns (true, userID, nil) idempotently.
+// If the bot is claimed by another user, it returns (false, owner, nil) without mutating state.
+// If persisting to disk fails, the claim is rolled back and an error is returned.
+func (s *State) TryClaim(userID string) (ok bool, owner string, err error) {
 	if userID == "" {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
-		return false, s.claimedUserID
+		return false, s.claimedUserID, nil
 	}
 
 	s.mu.Lock()
@@ -330,22 +331,26 @@ func (s *State) TryClaim(userID string) (ok bool, owner string) {
 
 	if s.claimedUserID == "" {
 		s.claimedUserID = userID
-		_ = s.saveLocked()
-		return true, userID
+		if err := s.saveLocked(); err != nil {
+			s.claimedUserID = ""
+			return false, "", err
+		}
+		return true, userID, nil
 	}
 
 	if s.claimedUserID == userID {
-		return true, userID
+		return true, userID, nil
 	}
 
-	return false, s.claimedUserID
+	return false, s.claimedUserID, nil
 }
 
 // Unclaim releases ownership of the bot instance if userID matches the current owner.
-// Returns true if successfully unclaimed, false otherwise.
-func (s *State) Unclaim(userID string) bool {
+// Returns (true, nil) if successfully unclaimed, (false, nil) if userID is not the owner,
+// or (false, err) if persisting to disk fails.
+func (s *State) Unclaim(userID string) (ok bool, err error) {
 	if userID == "" {
-		return false
+		return false, nil
 	}
 
 	s.mu.Lock()
@@ -353,11 +358,14 @@ func (s *State) Unclaim(userID string) bool {
 
 	if s.claimedUserID != "" && s.claimedUserID == userID {
 		s.claimedUserID = ""
-		_ = s.saveLocked()
-		return true
+		if err := s.saveLocked(); err != nil {
+			s.claimedUserID = userID
+			return false, err
+		}
+		return true, nil
 	}
 
-	return false
+	return false, nil
 }
 
 // IsAllowedUser checks whether a Discord user ID is permitted to interact with the bot.

@@ -122,7 +122,7 @@ func TestSlashGate_NonClaimCommandBlockedForNonOwner(t *testing.T) {
 	b, capturedResp, capturedFlags := setupTestBotWithSpy(t)
 
 	// Claim the bot as owner_1
-	ok, _ := b.State.TryClaim("owner_1")
+	ok, _, _ := b.State.TryClaim("owner_1")
 	if !ok {
 		t.Fatalf("TryClaim failed")
 	}
@@ -210,7 +210,7 @@ func TestSlashGate_HandleClaimSecondUserRejected(t *testing.T) {
 	b, capturedResp, capturedFlags := setupTestBotWithSpy(t)
 
 	// Claim as user_1
-	ok, _ := b.State.TryClaim("user_1")
+	ok, _, _ := b.State.TryClaim("user_1")
 	if !ok {
 		t.Fatalf("TryClaim failed")
 	}
@@ -268,7 +268,7 @@ func TestSlashGate_HandleClaimSecondUserRejected(t *testing.T) {
 func TestSlashGate_HandleUnclaim(t *testing.T) {
 	b, capturedResp, capturedFlags := setupTestBotWithSpy(t)
 
-	ok, _ := b.State.TryClaim("user_1")
+	ok, _, _ := b.State.TryClaim("user_1")
 	if !ok {
 		t.Fatalf("TryClaim failed")
 	}
@@ -343,7 +343,7 @@ func TestMessage_NonOwnerSilentlyIgnored(t *testing.T) {
 	})
 
 	// Claim bot as user_1
-	_, _ = b.State.TryClaim("user_1")
+	_, _, _ = b.State.TryClaim("user_1")
 
 	var requestsMade int64
 	b.Session.Client.Transport = fakeRoundTripper(func(req *http.Request) (*http.Response, error) {
@@ -382,7 +382,7 @@ func TestMessage_OwnerProcessed(t *testing.T) {
 	b, _, _ := setupTestBotWithSpy(t)
 
 	// Claim bot as user_1
-	_, _ = b.State.TryClaim("user_1")
+	_, _, _ = b.State.TryClaim("user_1")
 
 	// Channel is unbound
 	// Non-owner is dropped before binding check:
@@ -433,5 +433,84 @@ func TestMessage_UnclaimedDefaultClosedIgnored(t *testing.T) {
 
 	if atomic.LoadInt64(&requestsMade) != 0 {
 		t.Fatalf("expected zero HTTP requests in default-closed unclaimed mode, got %d", requestsMade)
+	}
+}
+
+func TestSlashGate_HandleClaim_SaveError(t *testing.T) {
+	b, capturedResp, capturedFlags := setupTestBotWithSpy(t)
+
+	// Make state persistence fail by pointing filePath into a regular file
+	blockingFile := filepath.Join(b.WsDir, "blocker")
+	if err := os.WriteFile(blockingFile, []byte("block"), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	b.State.filePath = filepath.Join(blockingFile, "invalid_dir", "state.json")
+
+	iClaim := &discordgo.InteractionCreate{
+		Interaction: &discordgo.Interaction{
+			ID:    "int_claim_err",
+			Token: "tok_claim_err",
+			Type:  discordgo.InteractionApplicationCommand,
+			Data: discordgo.ApplicationCommandInteractionData{
+				Name: "claim",
+			},
+			Member: &discordgo.Member{
+				User: &discordgo.User{ID: "user_1"},
+			},
+		},
+	}
+
+	b.HandleInteraction(b.Session, iClaim)
+
+	if !strings.Contains(strings.ToLower(*capturedResp), "failed to persist state, try again") {
+		t.Errorf("expected error message mentioning failed to persist state, got: %q", *capturedResp)
+	}
+	if *capturedFlags&discordgo.MessageFlagsEphemeral == 0 {
+		t.Errorf("expected ephemeral flag to be set")
+	}
+	if b.State.ClaimedUser() != "" {
+		t.Errorf("expected ClaimedUser to remain empty after failed persistence")
+	}
+}
+
+func TestSlashGate_HandleUnclaim_SaveError(t *testing.T) {
+	b, capturedResp, capturedFlags := setupTestBotWithSpy(t)
+
+	ok, _, err := b.State.TryClaim("user_1")
+	if !ok || err != nil {
+		t.Fatalf("TryClaim failed: ok=%v, err=%v", ok, err)
+	}
+
+	// Make state persistence fail
+	blockingFile := filepath.Join(b.WsDir, "blocker")
+	if err := os.WriteFile(blockingFile, []byte("block"), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	b.State.filePath = filepath.Join(blockingFile, "invalid_dir", "state.json")
+
+	iUnclaim := &discordgo.InteractionCreate{
+		Interaction: &discordgo.Interaction{
+			ID:    "int_unclaim_err",
+			Token: "tok_unclaim_err",
+			Type:  discordgo.InteractionApplicationCommand,
+			Data: discordgo.ApplicationCommandInteractionData{
+				Name: "unclaim",
+			},
+			Member: &discordgo.Member{
+				User: &discordgo.User{ID: "user_1"},
+			},
+		},
+	}
+
+	b.HandleInteraction(b.Session, iUnclaim)
+
+	if !strings.Contains(strings.ToLower(*capturedResp), "failed to persist state, try again") {
+		t.Errorf("expected error message mentioning failed to persist state, got: %q", *capturedResp)
+	}
+	if *capturedFlags&discordgo.MessageFlagsEphemeral == 0 {
+		t.Errorf("expected ephemeral flag to be set")
+	}
+	if b.State.ClaimedUser() != "user_1" {
+		t.Errorf("expected ClaimedUser to remain user_1 after failed persistence")
 	}
 }

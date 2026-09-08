@@ -17,7 +17,10 @@ func TestClaim_FirstClaimWins(t *testing.T) {
 		t.Fatalf("NewState failed: %v", err)
 	}
 
-	ok, owner := st.TryClaim("user_A")
+	ok, owner, err := st.TryClaim("user_A")
+	if err != nil {
+		t.Fatalf("unexpected error from TryClaim: %v", err)
+	}
 	if !ok || owner != "user_A" {
 		t.Fatalf("expected user_A claim to succeed, got ok=%v, owner=%q", ok, owner)
 	}
@@ -25,7 +28,10 @@ func TestClaim_FirstClaimWins(t *testing.T) {
 		t.Fatalf("expected ClaimedUser to be user_A, got %q", st.ClaimedUser())
 	}
 
-	ok, owner = st.TryClaim("user_B")
+	ok, owner, err = st.TryClaim("user_B")
+	if err != nil {
+		t.Fatalf("unexpected error from TryClaim: %v", err)
+	}
 	if ok || owner != "user_A" {
 		t.Fatalf("expected user_B claim to fail with owner=user_A, got ok=%v, owner=%q", ok, owner)
 	}
@@ -41,12 +47,18 @@ func TestClaim_Idempotent(t *testing.T) {
 		t.Fatalf("NewState failed: %v", err)
 	}
 
-	ok1, owner1 := st.TryClaim("user_A")
+	ok1, owner1, err1 := st.TryClaim("user_A")
+	if err1 != nil {
+		t.Fatalf("first claim error: %v", err1)
+	}
 	if !ok1 || owner1 != "user_A" {
 		t.Fatalf("first claim failed: ok=%v, owner=%q", ok1, owner1)
 	}
 
-	ok2, owner2 := st.TryClaim("user_A")
+	ok2, owner2, err2 := st.TryClaim("user_A")
+	if err2 != nil {
+		t.Fatalf("second claim error: %v", err2)
+	}
 	if !ok2 || owner2 != "user_A" {
 		t.Fatalf("second claim failed: ok=%v, owner=%q", ok2, owner2)
 	}
@@ -76,7 +88,7 @@ func TestClaim_ConcurrentRaceSingleWinner(t *testing.T) {
 		go func(id string) {
 			defer wg.Done()
 			<-startBarrier
-			ok, _ := st.TryClaim(id)
+			ok, _, _ := st.TryClaim(id)
 			if ok {
 				atomic.AddInt64(&successCount, 1)
 				winMu.Lock()
@@ -109,13 +121,13 @@ func TestUnclaim_OwnerReleases(t *testing.T) {
 		t.Fatalf("NewState failed: %v", err)
 	}
 
-	ok, _ := st.TryClaim("user_A")
-	if !ok {
-		t.Fatalf("TryClaim user_A failed")
+	ok, _, err := st.TryClaim("user_A")
+	if !ok || err != nil {
+		t.Fatalf("TryClaim user_A failed: ok=%v, err=%v", ok, err)
 	}
 
-	if !st.Unclaim("user_A") {
-		t.Fatalf("expected Unclaim by owner to return true")
+	if ok, err := st.Unclaim("user_A"); !ok || err != nil {
+		t.Fatalf("expected Unclaim by owner to return true, err=nil, got ok=%v, err=%v", ok, err)
 	}
 
 	if st.ClaimedUser() != "" {
@@ -123,9 +135,9 @@ func TestUnclaim_OwnerReleases(t *testing.T) {
 	}
 
 	// Now user_B can claim
-	ok, owner := st.TryClaim("user_B")
-	if !ok || owner != "user_B" {
-		t.Fatalf("expected user_B to successfully claim after unclaim, got ok=%v, owner=%q", ok, owner)
+	ok, owner, err := st.TryClaim("user_B")
+	if !ok || owner != "user_B" || err != nil {
+		t.Fatalf("expected user_B to successfully claim after unclaim, got ok=%v, owner=%q, err=%v", ok, owner, err)
 	}
 	if st.ClaimedUser() != "user_B" {
 		t.Fatalf("expected ClaimedUser to be user_B, got %q", st.ClaimedUser())
@@ -139,10 +151,10 @@ func TestUnclaim_NonOwnerRejected(t *testing.T) {
 		t.Fatalf("NewState failed: %v", err)
 	}
 
-	_, _ = st.TryClaim("user_A")
+	_, _, _ = st.TryClaim("user_A")
 
-	if st.Unclaim("user_B") {
-		t.Fatalf("expected Unclaim by non-owner to return false")
+	if ok, err := st.Unclaim("user_B"); ok || err != nil {
+		t.Fatalf("expected Unclaim by non-owner to return false, err=nil, got ok=%v, err=%v", ok, err)
 	}
 
 	if st.ClaimedUser() != "user_A" {
@@ -159,9 +171,9 @@ func TestClaim_SurvivesRestart(t *testing.T) {
 		t.Fatalf("NewState failed: %v", err)
 	}
 
-	ok, _ := st1.TryClaim("123456789012345678")
-	if !ok {
-		t.Fatalf("TryClaim failed")
+	ok, _, err := st1.TryClaim("123456789012345678")
+	if !ok || err != nil {
+		t.Fatalf("TryClaim failed: ok=%v, err=%v", ok, err)
 	}
 
 	// Reload from disk
@@ -191,9 +203,9 @@ func TestPersistence_ClaimedUserIDShape(t *testing.T) {
 	}
 
 	snowflake := "987654321098765432"
-	ok, _ := st.TryClaim(snowflake)
-	if !ok {
-		t.Fatalf("TryClaim failed")
+	ok, _, err := st.TryClaim(snowflake)
+	if !ok || err != nil {
+		t.Fatalf("TryClaim failed: ok=%v, err=%v", ok, err)
 	}
 
 	rawBytes, err := os.ReadFile(stateFile)
@@ -274,9 +286,9 @@ func TestDefaultPolicy_OpenAndClosed(t *testing.T) {
 	}
 
 	// 3. Once claimed, defaultOpen setting is superseded by owner check
-	ok, _ := st.TryClaim("owner_user")
-	if !ok {
-		t.Fatalf("TryClaim failed")
+	ok, _, err := st.TryClaim("owner_user")
+	if !ok || err != nil {
+		t.Fatalf("TryClaim failed: ok=%v, err=%v", ok, err)
 	}
 	if !st.IsAllowedUser("owner_user") {
 		t.Fatalf("expected claimed bot to allow owner")
@@ -331,5 +343,67 @@ func TestDefaultOpen_EnvEscapeHatch(t *testing.T) {
 	}
 	if stPolicyClosed.DefaultOpen() {
 		t.Fatalf("expected DefaultOpen to be false when WACKYDISCORD_DEFAULT_POLICY=closed")
+	}
+}
+
+func TestTryClaim_ReturnsErrorWhenSaveLockedFails(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
+	st, err := NewState(stateFile)
+	if err != nil {
+		t.Fatalf("NewState failed: %v", err)
+	}
+
+	// Make saveLocked fail by pointing filePath inside a regular file (causing ENOTDIR on MkdirAll)
+	blockingFile := filepath.Join(tmpDir, "blocker")
+	if err := os.WriteFile(blockingFile, []byte("block"), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	st.filePath = filepath.Join(blockingFile, "invalid_dir", "state.json")
+
+	ok, owner, err := st.TryClaim("user_A")
+	if err == nil {
+		t.Fatalf("expected error from TryClaim when saveLocked fails, got nil")
+	}
+	if ok {
+		t.Fatalf("expected ok=false when saveLocked fails, got true")
+	}
+	if owner != "" {
+		t.Fatalf("expected owner to be empty when claim fails, got %q", owner)
+	}
+	if st.ClaimedUser() != "" {
+		t.Fatalf("expected ClaimedUser to be rolled back to empty, got %q", st.ClaimedUser())
+	}
+}
+
+func TestUnclaim_ReturnsErrorWhenSaveLockedFails(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
+	st, err := NewState(stateFile)
+	if err != nil {
+		t.Fatalf("NewState failed: %v", err)
+	}
+
+	ok, _, err := st.TryClaim("user_A")
+	if !ok || err != nil {
+		t.Fatalf("TryClaim user_A failed: ok=%v, err=%v", ok, err)
+	}
+
+	// Make saveLocked fail
+	blockingFile := filepath.Join(tmpDir, "blocker")
+	if err := os.WriteFile(blockingFile, []byte("block"), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	st.filePath = filepath.Join(blockingFile, "invalid_dir", "state.json")
+
+	ok, err = st.Unclaim("user_A")
+	if err == nil {
+		t.Fatalf("expected error from Unclaim when saveLocked fails, got nil")
+	}
+	if ok {
+		t.Fatalf("expected ok=false when saveLocked fails, got true")
+	}
+	if st.ClaimedUser() != "user_A" {
+		t.Fatalf("expected ClaimedUser to remain user_A after rollback on failed save, got %q", st.ClaimedUser())
 	}
 }

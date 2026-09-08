@@ -142,7 +142,11 @@ func (b *Bot) handleClaimCommand(s *discordgo.Session, i *discordgo.InteractionC
 		return
 	}
 
-	ok, owner := b.State.TryClaim(uid)
+	ok, owner, err := b.State.TryClaim(uid)
+	if err != nil {
+		b.respondInteraction(s, i, "❌ Failed to persist state, try again.", true)
+		return
+	}
 	if ok {
 		b.respondInteraction(s, i, fmt.Sprintf("✅ Bot claimed successfully by <@%s>.", uid), true)
 		return
@@ -158,7 +162,12 @@ func (b *Bot) handleUnclaimCommand(s *discordgo.Session, i *discordgo.Interactio
 		return
 	}
 
-	if !b.State.Unclaim(uid) {
+	ok, err := b.State.Unclaim(uid)
+	if err != nil {
+		b.respondInteraction(s, i, "❌ Failed to persist state, try again.", true)
+		return
+	}
+	if !ok {
 		b.respondInteraction(s, i, "❌ Failed to unclaim: you are not the current owner.", true)
 		return
 	}
