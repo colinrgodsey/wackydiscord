@@ -20,6 +20,10 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		return
 	}
 
+	if !b.State.IsAllowedUser(m.Author.ID) {
+		return
+	}
+
 	// Pre-lock existence check: fast path to skip unbound channels without allocating a channel mutex
 	if b.State.GetBinding(m.ChannelID) == nil {
 		return

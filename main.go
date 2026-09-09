@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/colinrgodsey/wackydiscord/bot"
@@ -18,10 +19,12 @@ const (
 )
 
 var (
-	flagWs        string
-	flagToken     string
-	flagStateFile string
-	flagGuildID   string
+	flagWs            string
+	flagToken         string
+	flagStateFile     string
+	flagGuildID       string
+	flagDefaultOpen   bool
+	flagDefaultPolicy string
 )
 
 var rootCmd = &cobra.Command{
@@ -45,11 +48,20 @@ webhook persona impersonation, and real-time interactive conversations.`,
 			return fmt.Errorf("discord bot token is required: provide --token or set %s environment variable", EnvDiscordBotToken)
 		}
 
+		var defaultOpenPtr *bool
+		if cmd.Flags().Changed("default-policy") {
+			v := strings.ToLower(strings.TrimSpace(flagDefaultPolicy)) != "closed"
+			defaultOpenPtr = &v
+		} else if cmd.Flags().Changed("default-open") {
+			defaultOpenPtr = &flagDefaultOpen
+		}
+
 		b, err := bot.NewBot(bot.Config{
 			Token:         token,
 			WorkspaceDir:  wsDir,
 			StateFilePath: flagStateFile,
 			GuildID:       flagGuildID,
+			DefaultOpen:   defaultOpenPtr,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to initialize wackydiscord bot: %w", err)
@@ -67,6 +79,8 @@ func init() {
 	rootCmd.Flags().StringVar(&flagToken, "token", "", "Discord bot token (or DISCORD_BOT_TOKEN env var)")
 	rootCmd.Flags().StringVar(&flagStateFile, "state-file", "", "Custom state file path (default: <ws_dir>/.wackydiscord.json)")
 	rootCmd.Flags().StringVar(&flagGuildID, "guild-id", "", "Optional: register slash commands immediately to a specific guild ID")
+	rootCmd.Flags().StringVar(&flagDefaultPolicy, "default-policy", "open", "Allowlist policy when unclaimed: 'open' or 'closed'")
+	rootCmd.Flags().BoolVar(&flagDefaultOpen, "default-open", true, "Allow interaction before bot is claimed (starting default: true)")
 }
 
 func main() {
