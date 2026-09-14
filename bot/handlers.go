@@ -21,6 +21,10 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		return
 	}
 
+	if !b.State.IsAllowedUser(m.Author.ID) {
+		return
+	}
+
 	// Pre-lock existence check: fast path to skip unbound channels without allocating a channel mutex
 	if b.State.GetBinding(m.ChannelID) == nil {
 		return
@@ -82,10 +86,9 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		return
 	}
 
-	// 3. Atomic registration: Under LockChannelSync, perform [AddUserTurn + AddPendingUserHash]
-	var res *agentv1.AddUserTurnResponse
-	var addErr error
-
+	// 3. Mark channel as actively generating under LockChannelSync
+	expectedHash := ComputeTurnHash(genai.NewContentFromText(userText, "user"))
+	var shouldProceed bool
 	func() {
 		syncUnlock := b.State.LockChannelSync(m.ChannelID)
 		defer syncUnlock()
@@ -96,42 +99,15 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		}
 
 		bnd.IsGenerating = true
-		_ = b.State.SetBinding(bnd)
-
-		res, addErr = b.SDK.AddUserTurn(context.Background(), &agentv1.AddUserTurnRequest{
-			AgentId: binding.AgentID,
-			Message: userText,
-		})
-		if addErr != nil {
-			return
+		bnd.AddPendingUserHash(expectedHash)
+		if err := b.State.SetBinding(bnd); err != nil {
+			log.Printf("⚠️ failed to persist IsGenerating state in channel %s: %v", m.ChannelID, err)
 		}
-
-		freshBnd := b.State.GetBinding(m.ChannelID)
-		if freshBnd != nil && freshBnd.AgentID == binding.AgentID {
-			actualHash := ComputeTurnHash(SessionTurnToContent(res.GetTurn()))
-			freshBnd.AddPendingUserHash(actualHash)
-			freshBnd.IsGenerating = true
-			if freshBnd.LastTurnHash == "" {
-				freshBnd.LastTurnIndex = 0
-				freshBnd.LastTurnHash = actualHash
-			}
-			if err := b.State.SetBinding(freshBnd); err != nil {
-				log.Printf("⚠️ failed to persist IsGenerating state in channel %s: %v", m.ChannelID, err)
-			}
-		}
+		shouldProceed = true
 	}()
 
-	if addErr != nil {
-		_ = SendAgentMessage(s, m.ChannelID, "System", fmt.Sprintf("❌ **Turn error:** %v", addErr), nil)
+	if !shouldProceed {
 		return
-	}
-
-	if res == nil {
-		return
-	}
-
-	for _, w := range res.GetWarnings() {
-		log.Printf("⚠️ hook warning for agent %s: %s", binding.AgentID, w)
 	}
 
 	defer func() {
@@ -150,6 +126,46 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 			}
 		}
 	}()
+
+	// Perform AddUserTurn WITHOUT holding LockChannelSync. Holding LockChannelSync across
+	// AddUserTurn deadlocks with callers that hold agent session locks and rebind channels.
+	res, addErr := b.SDK.AddUserTurn(context.Background(), &agentv1.AddUserTurnRequest{
+		AgentId: binding.AgentID,
+		Message: userText,
+	})
+	if addErr != nil {
+		_ = SendAgentMessage(s, m.ChannelID, "System", fmt.Sprintf("❌ **Turn error:** %v", addErr), nil)
+		return
+	}
+
+	if res == nil {
+		return
+	}
+
+	func() {
+		syncUnlock := b.State.LockChannelSync(m.ChannelID)
+		defer syncUnlock()
+
+		freshBnd := b.State.GetBinding(m.ChannelID)
+		if freshBnd != nil && freshBnd.AgentID == binding.AgentID {
+			actualHash := ComputeTurnHash(SessionTurnToContent(res.GetTurn()))
+			if actualHash != expectedHash {
+				freshBnd.AddPendingUserHash(actualHash)
+			}
+			freshBnd.IsGenerating = true
+			if freshBnd.LastTurnHash == "" {
+				freshBnd.LastTurnIndex = 0
+				freshBnd.LastTurnHash = actualHash
+			}
+			if err := b.State.SetBinding(freshBnd); err != nil {
+				log.Printf("⚠️ failed to persist IsGenerating state in channel %s: %v", m.ChannelID, err)
+			}
+		}
+	}()
+
+	for _, w := range res.GetWarnings() {
+		log.Printf("⚠️ hook warning for agent %s: %s", binding.AgentID, w)
+	}
 
 	stopTyping := make(chan struct{})
 	if s != nil {

@@ -65,6 +65,28 @@ var SlashCommands = []*discordgo.ApplicationCommand{
 		Name:        "stop",
 		Description: "Cancel the in-flight turn of the bound agent",
 	},
+	{
+		Name:        "claim",
+		Description: "Claim ownership of this bot instance",
+	},
+	{
+		Name:        "unclaim",
+		Description: "Release ownership of this bot instance",
+	},
+}
+
+// interactionUserID extracts the caller's Discord user ID from an interaction, handling both guild Member and DM User.
+func interactionUserID(i *discordgo.InteractionCreate) string {
+	if i == nil {
+		return ""
+	}
+	if i.Member != nil && i.Member.User != nil {
+		return i.Member.User.ID
+	}
+	if i.User != nil {
+		return i.User.ID
+	}
+	return ""
 }
 
 // RegisterSlashCommands registers all application commands globally or for a specific guild.
@@ -85,7 +107,21 @@ func (b *Bot) HandleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 
 	data := i.ApplicationCommandData()
+	uid := interactionUserID(i)
+	if data.Name != "claim" && !b.State.IsAllowedUser(uid) {
+		msg := "❌ This bot is claimed by another user."
+		if b.State.ClaimedUser() == "" {
+			msg = "❌ This bot is unclaimed — run `/claim` to take ownership."
+		}
+		b.respondInteraction(s, i, msg, true)
+		return
+	}
+
 	switch data.Name {
+	case "claim":
+		b.handleClaimCommand(s, i)
+	case "unclaim":
+		b.handleUnclaimCommand(s, i)
 	case "bind":
 		b.handleBindCommand(s, i)
 	case "unbind":
@@ -101,6 +137,46 @@ func (b *Bot) HandleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 	case "stop":
 		b.handleStopCommand(s, i)
 	}
+}
+
+func (b *Bot) handleClaimCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	uid := interactionUserID(i)
+	if uid == "" {
+		b.respondInteraction(s, i, "❌ Unable to identify Discord user.", true)
+		return
+	}
+
+	ok, owner, err := b.State.TryClaim(uid)
+	if err != nil {
+		b.respondInteraction(s, i, "❌ Failed to persist state, try again.", true)
+		return
+	}
+	if ok {
+		b.respondInteraction(s, i, fmt.Sprintf("✅ Bot claimed successfully by <@%s>.", uid), true)
+		return
+	}
+
+	b.respondInteraction(s, i, fmt.Sprintf("❌ This bot is already claimed by <@%s>.", owner), true)
+}
+
+func (b *Bot) handleUnclaimCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	uid := interactionUserID(i)
+	if uid == "" {
+		b.respondInteraction(s, i, "❌ Unable to identify Discord user.", true)
+		return
+	}
+
+	ok, err := b.State.Unclaim(uid)
+	if err != nil {
+		b.respondInteraction(s, i, "❌ Failed to persist state, try again.", true)
+		return
+	}
+	if !ok {
+		b.respondInteraction(s, i, "❌ Failed to unclaim: you are not the current owner.", true)
+		return
+	}
+
+	b.respondInteraction(s, i, "✅ Bot ownership released. Anyone can now claim the bot using `/claim`.", true)
 }
 
 func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {

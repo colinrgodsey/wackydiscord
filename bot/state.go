@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -14,6 +15,12 @@ const (
 
 	// MaxPendingUserHashes is the maximum capacity of the FIFO ring buffer for deduplicating user turns.
 	MaxPendingUserHashes = 20
+
+	// EnvDefaultOpen is the environment variable for controlling allowlist policy when unclaimed.
+	EnvDefaultOpen = "WACKYDISCORD_DEFAULT_OPEN"
+
+	// EnvDefaultPolicy is the environment variable for allowlist default policy ("open" or "closed").
+	EnvDefaultPolicy = "WACKYDISCORD_DEFAULT_POLICY"
 )
 
 // ChannelBinding records the association between a Discord channel and a WackyPub agent.
@@ -60,19 +67,39 @@ func (b *ChannelBinding) ConsumePendingUserHash(hash string) bool {
 
 // State manages channel-to-agent bindings across bot restarts.
 type State struct {
-	mu          sync.RWMutex
-	chanLocksMu sync.Mutex
-	chanSyncMu  map[string]*sync.Mutex
-	chanTurnMu  map[string]*sync.Mutex
-	chanDrainMu map[string]*sync.Mutex
-	filePath    string
-	Bindings    map[string]*ChannelBinding `json:"bindings"`
+	mu            sync.RWMutex
+	chanLocksMu   sync.Mutex
+	chanSyncMu    map[string]*sync.Mutex
+	chanTurnMu    map[string]*sync.Mutex
+	chanDrainMu   map[string]*sync.Mutex
+	filePath      string
+	claimedUserID string
+	defaultOpen   bool
+	Bindings      map[string]*ChannelBinding `json:"bindings"`
 }
 
 // NewState loads or initializes state from the specified JSON file.
 func NewState(filePath string) (*State, error) {
+	defaultOpen := true
+	if v := os.Getenv(EnvDefaultOpen); v != "" {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "0" || v == "false" || v == "f" || v == "closed" || v == "no" {
+			defaultOpen = false
+		} else if v == "1" || v == "true" || v == "t" || v == "open" || v == "yes" {
+			defaultOpen = true
+		}
+	} else if v := os.Getenv(EnvDefaultPolicy); v != "" {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "closed" {
+			defaultOpen = false
+		} else if v == "open" {
+			defaultOpen = true
+		}
+	}
+
 	s := &State{
 		filePath:    filePath,
+		defaultOpen: defaultOpen,
 		Bindings:    make(map[string]*ChannelBinding),
 		chanSyncMu:  make(map[string]*sync.Mutex),
 		chanTurnMu:  make(map[string]*sync.Mutex),
@@ -81,13 +108,17 @@ func NewState(filePath string) (*State, error) {
 
 	if data, err := os.ReadFile(filePath); err == nil {
 		var loaded struct {
-			Bindings map[string]*ChannelBinding `json:"bindings"`
+			ClaimedUserID string                     `json:"claimed_user_id,omitempty"`
+			Bindings      map[string]*ChannelBinding `json:"bindings"`
 		}
-		if err := json.Unmarshal(data, &loaded); err == nil && loaded.Bindings != nil {
-			s.Bindings = loaded.Bindings
-			for _, b := range s.Bindings {
-				if b != nil {
-					b.IsGenerating = false
+		if err := json.Unmarshal(data, &loaded); err == nil {
+			s.claimedUserID = loaded.ClaimedUserID
+			if loaded.Bindings != nil {
+				s.Bindings = loaded.Bindings
+				for _, b := range s.Bindings {
+					if b != nil {
+						b.IsGenerating = false
+					}
 				}
 			}
 		}
@@ -241,9 +272,11 @@ func (s *State) saveLocked() error {
 	}
 
 	data, err := json.MarshalIndent(struct {
-		Bindings map[string]*ChannelBinding `json:"bindings"`
+		ClaimedUserID string                     `json:"claimed_user_id,omitempty"`
+		Bindings      map[string]*ChannelBinding `json:"bindings"`
 	}{
-		Bindings: s.Bindings,
+		ClaimedUserID: s.claimedUserID,
+		Bindings:      s.Bindings,
 	}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal state: %w", err)
@@ -265,4 +298,97 @@ func (s *State) saveLocked() error {
 	}
 
 	return nil
+}
+
+// SetDefaultOpen sets the default policy when the bot is unclaimed.
+func (s *State) SetDefaultOpen(open bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.defaultOpen = open
+}
+
+// DefaultOpen returns the default policy when the bot is unclaimed.
+func (s *State) DefaultOpen() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.defaultOpen
+}
+
+// TryClaim attempts to claim ownership of the bot instance for the given user ID.
+// If the bot is unclaimed, the claim succeeds and is persisted to disk.
+// If the bot is already claimed by userID, it returns (true, userID, nil) idempotently.
+// If the bot is claimed by another user, it returns (false, owner, nil) without mutating state.
+// If persisting to disk fails, the claim is rolled back and an error is returned.
+func (s *State) TryClaim(userID string) (ok bool, owner string, err error) {
+	if userID == "" {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return false, s.claimedUserID, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.claimedUserID == "" {
+		s.claimedUserID = userID
+		if err := s.saveLocked(); err != nil {
+			s.claimedUserID = ""
+			return false, "", err
+		}
+		return true, userID, nil
+	}
+
+	if s.claimedUserID == userID {
+		return true, userID, nil
+	}
+
+	return false, s.claimedUserID, nil
+}
+
+// Unclaim releases ownership of the bot instance if userID matches the current owner.
+// Returns (true, nil) if successfully unclaimed, (false, nil) if userID is not the owner,
+// or (false, err) if persisting to disk fails.
+func (s *State) Unclaim(userID string) (ok bool, err error) {
+	if userID == "" {
+		return false, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.claimedUserID != "" && s.claimedUserID == userID {
+		s.claimedUserID = ""
+		if err := s.saveLocked(); err != nil {
+			s.claimedUserID = userID
+			return false, err
+		}
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// IsAllowedUser checks whether a Discord user ID is permitted to interact with the bot.
+// If the bot is unclaimed, it returns the default policy (defaultOpen).
+// If the bot is claimed, only the claimed user ID is permitted.
+func (s *State) IsAllowedUser(userID string) bool {
+	if userID == "" {
+		return false
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.claimedUserID == "" {
+		return s.defaultOpen
+	}
+
+	return userID == s.claimedUserID
+}
+
+// ClaimedUser returns the Discord user ID of the current owner, or empty string if unclaimed.
+func (s *State) ClaimedUser() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.claimedUserID
 }

@@ -18,6 +18,7 @@ type Config struct {
 	WorkspaceDir  string
 	StateFilePath string
 	GuildID       string // Optional: registers slash commands to a specific guild for instant availability
+	DefaultOpen   *bool  // Optional: override allowlist default policy when unclaimed
 }
 
 // Bot manages the Discord gateway session, channel bindings, and WackyPub agent integration.
@@ -67,6 +68,9 @@ func NewBot(cfg Config) (*Bot, error) {
 	st, err := NewState(statePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize state: %w", err)
+	}
+	if cfg.DefaultOpen != nil {
+		st.SetDefaultOpen(*cfg.DefaultOpen)
 	}
 
 	dg, err := discordgo.New("Bot " + cfg.Token)
