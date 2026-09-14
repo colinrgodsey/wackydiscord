@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/colinrgodsey/wackypub/pkg/agent"
+	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 	"google.golang.org/genai"
 )
 
@@ -227,14 +229,17 @@ func TestWatcher_UserMessageNotEchoedBack_AtomicRegistration(t *testing.T) {
 		bnd.IsGenerating = true
 		_ = st.SetBinding(bnd)
 
-		res, err := b.SDK.AddUserTurn(bnd.AgentID, userMsgText)
+		res, err := b.SDK.AddUserTurn(context.Background(), &agentv1.AddUserTurnRequest{
+			AgentId: bnd.AgentID,
+			Message: userMsgText,
+		})
 		if err != nil {
 			t.Fatalf("AddUserTurn failed: %v", err)
 		}
 
 		freshBnd := st.GetBinding(channelID)
 		if freshBnd != nil && freshBnd.AgentID == binding.AgentID {
-			actualHash := ComputeTurnHash(res.Content)
+			actualHash := ComputeTurnHash(SessionTurnToContent(res.GetTurn()))
 			freshBnd.AddPendingUserHash(actualHash)
 			freshBnd.IsGenerating = true
 			if err := st.SetBinding(freshBnd); err != nil {

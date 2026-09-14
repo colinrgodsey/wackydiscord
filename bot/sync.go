@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,8 +10,35 @@ import (
 	"strings"
 
 	"github.com/colinrgodsey/wackypub/pkg/agent"
+	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 	"google.golang.org/genai"
 )
+
+// SessionTurnToContent converts a proto SessionTurn into a *genai.Content struct.
+func SessionTurnToContent(st *agentv1.SessionTurn) *genai.Content {
+	if st == nil {
+		return nil
+	}
+	c := &genai.Content{
+		Role: st.Role,
+	}
+	for _, p := range st.Parts {
+		if p == nil {
+			continue
+		}
+		part := &genai.Part{
+			Text: p.Text,
+		}
+		if len(p.InlineData) > 0 || p.MimeType != "" {
+			part.InlineData = &genai.Blob{
+				Data:     p.InlineData,
+				MIMEType: p.MimeType,
+			}
+		}
+		c.Parts = append(c.Parts, part)
+	}
+	return c
+}
 
 // ComputeTurnHash generates a deterministic SHA-256 hash of a turn's role and content parts.
 // Used for deduplicating messages across Discord channel backfills and compaction events.
@@ -241,11 +269,14 @@ func ExpandScratchpadSentinels(sdk *agent.AgentSDK, agentID string, text string)
 		}
 		id := idMatch[1]
 
-		content, err := sdk.GetScratchpad(agentID, id, nil, nil)
-		if err != nil || content == "" {
+		resp, err := sdk.GetScratchpad(context.Background(), &agentv1.GetScratchpadRequest{
+			AgentId: agentID,
+			EntryId: id,
+		})
+		if err != nil || resp == nil || resp.GetText() == "" {
 			return match
 		}
 
-		return content
+		return resp.GetText()
 	})
 }

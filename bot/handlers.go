@@ -10,6 +10,7 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/colinrgodsey/wackypub/pkg/agent"
+	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 	"google.golang.org/genai"
 )
 
@@ -35,13 +36,13 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 	}
 
 	// Verify bound agent exists and has valid configuration
-	insp, err := b.SDK.InspectAgent(binding.AgentID)
-	if err != nil || insp == nil || !insp.AgentDirExists {
+	insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID})
+	if err != nil || insp == nil || !insp.GetAgentDirExists() {
 		_ = SendAgentMessage(s, m.ChannelID, "System", fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`. Use `/bind <agent_id>` to connect a valid agent.", binding.AgentID, b.WsDir), nil)
 		return
 	}
-	if insp.RuntimeJSONExists && !insp.RuntimeJSONValid {
-		_ = SendAgentMessage(s, m.ChannelID, "System", fmt.Sprintf("⚠️ **Agent Configuration Error:** Agent %q has an invalid `runtime.json`: %s", binding.AgentID, insp.RuntimeJSONError), nil)
+	if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
+		_ = SendAgentMessage(s, m.ChannelID, "System", fmt.Sprintf("⚠️ **Agent Configuration Error:** Agent %q has an invalid `runtime.json`: %s", binding.AgentID, insp.GetRuntimeJsonError()), nil)
 		return
 	}
 
@@ -82,7 +83,7 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 	}
 
 	// 3. Atomic registration: Under LockChannelSync, perform [AddUserTurn + AddPendingUserHash]
-	var res *agent.UserTurnResult
+	var res *agentv1.AddUserTurnResponse
 	var addErr error
 
 	func() {
@@ -97,14 +98,17 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		bnd.IsGenerating = true
 		_ = b.State.SetBinding(bnd)
 
-		res, addErr = b.SDK.AddUserTurn(binding.AgentID, userText)
+		res, addErr = b.SDK.AddUserTurn(context.Background(), &agentv1.AddUserTurnRequest{
+			AgentId: binding.AgentID,
+			Message: userText,
+		})
 		if addErr != nil {
 			return
 		}
 
 		freshBnd := b.State.GetBinding(m.ChannelID)
 		if freshBnd != nil && freshBnd.AgentID == binding.AgentID {
-			actualHash := ComputeTurnHash(res.Content)
+			actualHash := ComputeTurnHash(SessionTurnToContent(res.GetTurn()))
 			freshBnd.AddPendingUserHash(actualHash)
 			freshBnd.IsGenerating = true
 			if freshBnd.LastTurnHash == "" {
@@ -126,7 +130,7 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		return
 	}
 
-	for _, w := range res.Warnings {
+	for _, w := range res.GetWarnings() {
 		log.Printf("⚠️ hook warning for agent %s: %s", binding.AgentID, w)
 	}
 
@@ -182,14 +186,17 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 
 	ctx := context.Background()
 
-	var streamErr error
-	for _, err := range b.SDK.GenerateTurnStream(ctx, binding.AgentID) {
-		if err != nil {
-			streamErr = err
-			break
-		}
+	stream := agent.NewInProcessStream[agentv1.GenerateTurnStreamResponse](ctx, 16)
+	errCh := make(chan error, 1)
+	go func() {
+		defer stream.Close()
+		errCh <- b.SDK.GenerateTurnStream(&agentv1.GenerateTurnStreamRequest{AgentId: binding.AgentID}, stream)
+	}()
+
+	for range stream.Chunks() {
 		// SessionWatcher is now the primary live renderer. Do not post duplicate live chunks from handler loop.
 	}
+	streamErr := <-errCh
 	close(stopTyping)
 
 	func() {
@@ -230,7 +237,12 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		return 0, nil
 	}
 
-	turns, err := b.SDK.ReadSession(bnd.AgentID)
+	if _, err := b.SDK.ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: bnd.AgentID}); err != nil {
+		syncUnlock()
+		return 0, fmt.Errorf("failed to read session turns: %w", err)
+	}
+
+	turns, err := agent.ReadSessionTurns(b.SDK.AgentDir(bnd.AgentID))
 	if err != nil {
 		syncUnlock()
 		return 0, fmt.Errorf("failed to read session turns: %w", err)

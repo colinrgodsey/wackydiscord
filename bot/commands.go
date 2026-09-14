@@ -1,10 +1,14 @@
 package bot
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/colinrgodsey/wackypub/pkg/agent"
+	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
+	"google.golang.org/genai"
 )
 
 // SlashCommands defines the Discord application commands registered by wackydiscord.
@@ -116,9 +120,13 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 
 	// Verify agent exists
-	insp, err := b.SDK.InspectAgent(agentID)
-	if err != nil || insp == nil || !insp.AgentDirExists {
-		availAgents, _ := b.SDK.ListAgents()
+	insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: agentID})
+	if err != nil || insp == nil || !insp.GetAgentDirExists() {
+		listResp, _ := b.SDK.ListAgents(context.Background(), &agentv1.ListAgentsRequest{})
+		var availAgents []string
+		if listResp != nil {
+			availAgents = listResp.GetAgentIds()
+		}
 		availStr := "none"
 		if len(availAgents) > 0 {
 			availStr = strings.Join(availAgents, ", ")
@@ -127,14 +135,16 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
-	if insp.RuntimeJSONExists && !insp.RuntimeJSONValid {
-		b.respondInteraction(s, i, fmt.Sprintf("❌ Agent %q has an invalid `runtime.json`: %s", agentID, insp.RuntimeJSONError), true)
+	if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
+		b.respondInteraction(s, i, fmt.Sprintf("❌ Agent %q has an invalid `runtime.json`: %s", agentID, insp.GetRuntimeJsonError()), true)
 		return
 	}
 
 	modelName := "default"
-	if insp.RuntimeConfig != nil && insp.RuntimeConfig.Model != "" {
-		modelName = insp.RuntimeConfig.Model
+	if insp.GetRuntimeJsonValid() {
+		if cfg, err := agent.LoadRuntimeConfig(insp.GetAgentDir()); err == nil && cfg != nil && cfg.Model != "" {
+			modelName = cfg.Model
+		}
 	}
 
 	// Look up or create channel webhook
@@ -145,7 +155,13 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 
 	// Read existing turns to initialize sync state
-	turns, _ := b.SDK.ReadSession(agentID)
+	readResp, _ := b.SDK.ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: agentID})
+	var turns []*genai.Content
+	if readResp != nil {
+		for _, t := range readResp.GetTurns() {
+			turns = append(turns, SessionTurnToContent(t))
+		}
+	}
 	lastIdx := len(turns) - 1
 	lastHash := ""
 	if lastIdx >= 0 {
@@ -216,13 +232,17 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, i *discordgo.Interaction
 		return
 	}
 
-	insp, err := b.SDK.InspectAgent(binding.AgentID)
-	if err != nil || insp == nil || !insp.AgentDirExists {
+	insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID})
+	if err != nil || insp == nil || !insp.GetAgentDirExists() {
 		b.respondInteraction(s, i, fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`.", binding.AgentID, b.WsDir), true)
 		return
 	}
 
-	mem, _ := b.SDK.ReadMemory(binding.AgentID)
+	memResp, _ := b.SDK.ReadMemory(context.Background(), &agentv1.ReadMemoryRequest{AgentId: binding.AgentID})
+	mem := ""
+	if memResp != nil {
+		mem = memResp.GetMemoryMd()
+	}
 	memSnippet := strings.TrimSpace(mem)
 	if len(memSnippet) > 300 {
 		memSnippet = memSnippet[:300] + "..."
@@ -233,15 +253,17 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, i *discordgo.Interaction
 
 	modelName := "default"
 	endpoint := "default"
-	if insp.RuntimeConfig != nil {
-		if insp.RuntimeConfig.Model != "" {
-			modelName = insp.RuntimeConfig.Model
+	if insp.GetRuntimeJsonValid() {
+		if cfg, err := agent.LoadRuntimeConfig(insp.GetAgentDir()); err == nil && cfg != nil {
+			if cfg.Model != "" {
+				modelName = cfg.Model
+			}
+			if cfg.Endpoint != "" {
+				endpoint = cfg.Endpoint
+			}
 		}
-		if insp.RuntimeConfig.Endpoint != "" {
-			endpoint = insp.RuntimeConfig.Endpoint
-		}
-	} else if insp.RuntimeJSONExists && !insp.RuntimeJSONValid {
-		modelName = fmt.Sprintf("error: %s", insp.RuntimeJSONError)
+	} else if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
+		modelName = fmt.Sprintf("error: %s", insp.GetRuntimeJsonError())
 	}
 
 	status := fmt.Sprintf(
@@ -251,12 +273,12 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, i *discordgo.Interaction
 			"🔧 **Tools Available:** %d (%s)\n"+
 			"🔊 **Verbose Mode:** `%v`\n\n"+
 			"🧠 **Memory Preview:**\n```markdown\n%s\n```",
-		insp.AgentID,
+		insp.GetAgentId(),
 		modelName,
 		endpoint,
-		insp.SessionTurnCount,
-		len(insp.DiscoveredTools),
-		strings.Join(insp.DiscoveredTools, ", "),
+		insp.GetSessionTurnCount(),
+		len(insp.GetDiscoveredTools()),
+		strings.Join(insp.GetDiscoveredTools(), ", "),
 		binding.Verbose,
 		memSnippet,
 	)
@@ -293,8 +315,8 @@ func (b *Bot) handleFillCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 	syncUnlock()
 
-	insp, err := b.SDK.InspectAgent(binding.AgentID)
-	if err != nil || insp == nil || !insp.AgentDirExists {
+	insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID})
+	if err != nil || insp == nil || !insp.GetAgentDirExists() {
 		b.editInteractionResponse(s, i, fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`.", binding.AgentID, b.WsDir))
 		return
 	}
@@ -352,11 +374,12 @@ func (b *Bot) handleVerboseCommand(s *discordgo.Session, i *discordgo.Interactio
 }
 
 func (b *Bot) handleAgentsCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	ids, err := b.SDK.ListAgents()
+	resp, err := b.SDK.ListAgents(context.Background(), &agentv1.ListAgentsRequest{})
 	if err != nil {
 		b.respondInteraction(s, i, fmt.Sprintf("❌ Failed to list agents: %v", err), true)
 		return
 	}
+	ids := resp.GetAgentIds()
 
 	if len(ids) == 0 {
 		b.respondInteraction(s, i, fmt.Sprintf("📂 No agents found in workspace `%s`.", b.WsDir), true)
@@ -366,22 +389,22 @@ func (b *Bot) handleAgentsCommand(s *discordgo.Session, i *discordgo.Interaction
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("📂 **Workspace Agents (%d found):**\n\n", len(ids)))
 	for _, id := range ids {
-		insp, err := b.SDK.InspectAgent(id)
+		insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: id})
 		if err != nil || insp == nil {
 			sb.WriteString(fmt.Sprintf("• `%s` *(inspection error)*\n", id))
 			continue
 		}
 		statusIcon := "⚪"
 		modelName := "default"
-		if insp.RuntimeJSONValid && insp.RuntimeConfig != nil {
+		if insp.GetRuntimeJsonValid() {
 			statusIcon = "🟢"
-			if insp.RuntimeConfig.Model != "" {
-				modelName = insp.RuntimeConfig.Model
+			if cfg, err := agent.LoadRuntimeConfig(insp.GetAgentDir()); err == nil && cfg != nil && cfg.Model != "" {
+				modelName = cfg.Model
 			}
-		} else if insp.RuntimeJSONExists {
+		} else if insp.GetRuntimeJsonExists() {
 			statusIcon = "🟡"
 		}
-		sb.WriteString(fmt.Sprintf("%s **`%s`** — Model: `%s`, Turns: %d, Tools: %d\n", statusIcon, id, modelName, insp.SessionTurnCount, len(insp.DiscoveredTools)))
+		sb.WriteString(fmt.Sprintf("%s **`%s`** — Model: `%s`, Turns: %d, Tools: %d\n", statusIcon, id, modelName, insp.GetSessionTurnCount(), len(insp.GetDiscoveredTools())))
 	}
 
 	b.respondInteraction(s, i, sb.String(), false)
@@ -394,7 +417,7 @@ func (b *Bot) handleStopCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
-	if err := b.SDK.CancelTurn(binding.AgentID); err != nil {
+	if _, err := b.SDK.CancelTurn(context.Background(), &agentv1.CancelTurnRequest{AgentId: binding.AgentID}); err != nil {
 		b.respondInteraction(s, i, fmt.Sprintf("ℹ️ No in-flight turn for agent **%s**.", binding.AgentID), false)
 		return
 	}
