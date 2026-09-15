@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/colinrgodsey/wackypub/pkg/agent"
+	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 )
 
 func TestInteractionUserID_GuildAndDM(t *testing.T) {
@@ -372,9 +374,9 @@ func TestMessage_NonOwnerSilentlyIgnored(t *testing.T) {
 	}
 
 	// Verify no session turns were recorded
-	turns, _ := b.SDK.ReadSession("bob")
-	if len(turns) != 0 {
-		t.Fatalf("expected 0 session turns for agent bob, got %d", len(turns))
+	res, _ := b.SDK.ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: "bob"})
+	if res != nil && len(res.GetTurns()) != 0 {
+		t.Fatalf("expected 0 session turns for agent bob, got %d", len(res.GetTurns()))
 	}
 }
 

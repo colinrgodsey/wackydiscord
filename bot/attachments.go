@@ -14,6 +14,7 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/colinrgodsey/wackypub/pkg/agent"
+	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 )
 
 // inlineTextExtensions defines the allowlist of file extensions permitted for inline text display.
@@ -225,7 +226,10 @@ func (b *Bot) ProcessAttachments(ctx context.Context, agentID string, attachment
 
 		if isImageAttachment(att) {
 			if len(data) > 0 {
-				if _, addErr := b.SDK.AddMedia(agentID, bytes.NewReader(data)); addErr == nil {
+				if _, addErr := b.SDK.AddMedia(budgetCtx, &agentv1.AddMediaRequest{
+					AgentId:   agentID,
+					MediaData: data,
+				}); addErr == nil {
 					result.ImagesDownloaded++
 				} else {
 					log.Printf("⚠️ AddMedia failed for attachment %s: %v", sanitizedName, addErr)

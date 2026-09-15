@@ -9,6 +9,7 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/colinrgodsey/wackypub/pkg/agent"
+	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 )
 
 // Config defines the runtime configuration options for the WackyDiscord bot.
@@ -130,11 +131,11 @@ func (b *Bot) ValidateBindings() []string {
 	var warnings []string
 	bindings := b.State.GetAllBindings()
 	for channelID, binding := range bindings {
-		insp, err := b.SDK.InspectAgent(binding.AgentID)
-		if err != nil || insp == nil || !insp.AgentDirExists {
+		insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID})
+		if err != nil || insp == nil || !insp.GetAgentDirExists() {
 			warnings = append(warnings, fmt.Sprintf("channel %s is bound to missing agent %q in workspace %s", channelID, binding.AgentID, b.WsDir))
-		} else if insp.RuntimeJSONExists && !insp.RuntimeJSONValid {
-			warnings = append(warnings, fmt.Sprintf("channel %s is bound to agent %q with invalid runtime.json: %s", channelID, binding.AgentID, insp.RuntimeJSONError))
+		} else if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
+			warnings = append(warnings, fmt.Sprintf("channel %s is bound to agent %q with invalid runtime.json: %s", channelID, binding.AgentID, insp.GetRuntimeJsonError()))
 		}
 	}
 	return warnings

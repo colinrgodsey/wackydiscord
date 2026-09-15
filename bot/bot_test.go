@@ -16,6 +16,7 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/colinrgodsey/wackypub/pkg/agent"
+	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 	"google.golang.org/genai"
 )
 
@@ -467,17 +468,27 @@ func TestFormattingHelpers(t *testing.T) {
 		sdk := agent.NewSDK(wsDir)
 
 		// Create scratchpad entries
-		entry1, err := sdk.CreateScratchpad("bob", "The rain fell heavily across Neo-Tokyo.", "test")
+		resp1, err := sdk.CreateScratchpad(context.Background(), &agentv1.CreateScratchpadRequest{
+			AgentId:   "bob",
+			Text:      "The rain fell heavily across Neo-Tokyo.",
+			CreatedBy: "test",
+		})
 		if err != nil {
 			t.Fatalf("CreateScratchpad failed: %v", err)
 		}
-		entry2, err := sdk.CreateScratchpad("bob", "A shadow stepped out from the alley.", "test")
+		entry1 := resp1.GetEntry()
+		resp2, err := sdk.CreateScratchpad(context.Background(), &agentv1.CreateScratchpadRequest{
+			AgentId:   "bob",
+			Text:      "A shadow stepped out from the alley.",
+			CreatedBy: "test",
+		})
 		if err != nil {
 			t.Fatalf("CreateScratchpad failed: %v", err)
 		}
+		entry2 := resp2.GetEntry()
 
 		// 1. Single sentinel expansion
-		rawText1 := fmt.Sprintf("Prologue:\n<SCRATCHPAD_EXPAND id=%q />", entry1.ID)
+		rawText1 := fmt.Sprintf("Prologue:\n<SCRATCHPAD_EXPAND id=%q />", entry1.GetEntryId())
 		expanded1 := ExpandScratchpadSentinels(sdk, "bob", rawText1)
 		expected1 := fmt.Sprintf("Prologue:\n%s", "The rain fell heavily across Neo-Tokyo.")
 		if expanded1 != expected1 {
@@ -485,7 +496,7 @@ func TestFormattingHelpers(t *testing.T) {
 		}
 
 		// 2. Multiple sentinels with mixed case and quote styles
-		rawText2 := fmt.Sprintf("Chapter 1:\n<SCRATCHPAD_EXPAND id=%q/>\nChapter 2:\n<scratchpad_expand id='%s' />", entry1.ID, entry2.ID)
+		rawText2 := fmt.Sprintf("Chapter 1:\n<SCRATCHPAD_EXPAND id=%q/>\nChapter 2:\n<scratchpad_expand id='%s' />", entry1.GetEntryId(), entry2.GetEntryId())
 		expanded2 := ExpandScratchpadSentinels(sdk, "bob", rawText2)
 		expected2 := "Chapter 1:\nThe rain fell heavily across Neo-Tokyo.\nChapter 2:\nA shadow stepped out from the alley."
 		if expanded2 != expected2 {
@@ -1309,9 +1320,17 @@ func TestStopCommand(t *testing.T) {
 
 	streamDone := make(chan struct{})
 	go func() {
-		for range sdk.AddAndGenerateTurnStream(context.Background(), "bob", "Hello") {
+		defer close(streamDone)
+		stream := agent.NewInProcessStream[agentv1.AddAndGenerateTurnStreamResponse](context.Background(), 16)
+		go func() {
+			defer stream.Close()
+			_ = sdk.AddAndGenerateTurnStream(&agentv1.AddAndGenerateTurnStreamRequest{
+				AgentId:     "bob",
+				UserMessage: "Hello",
+			}, stream)
+		}()
+		for range stream.Chunks() {
 		}
-		close(streamDone)
 	}()
 
 	select {
@@ -1413,7 +1432,7 @@ func TestHandleMessageCreate_TurnStoppedOnCancel(t *testing.T) {
 	}
 
 	// Cancel the turn via SDK
-	if err := b.SDK.CancelTurn("bob"); err != nil {
+	if _, err := b.SDK.CancelTurn(context.Background(), &agentv1.CancelTurnRequest{AgentId: "bob"}); err != nil {
 		t.Fatalf("CancelTurn failed: %v", err)
 	}
 
