@@ -486,6 +486,19 @@ func (b *Bot) handleAgentsCommand(s *discordgo.Session, i *discordgo.Interaction
 	b.respondInteraction(s, i, sb.String(), false)
 }
 
+// handleStopCommand cancels the in-flight generation for the agent bound to the
+// channel where /stop was invoked. Authorization is enforced in HandleInteraction:
+// /stop is not the /claim command, so the D102 allowlist gate (IsAllowedUser) runs
+// first and only the claimed owner reaches this handler - nobody else can cancel
+// a turn they did not start.
+//
+// Cancel semantics (chosen and documented): PARTIAL COMMIT. HandleMessageCreate
+// persists the user's message to session.jsonl via AddUserTurn BEFORE generation
+// starts, so a cancelled turn keeps the user turn and cleanly aborts the model
+// turn - no torn/partial model output is ever written. The orphaned user turn is
+// reconciled with the next user message by CleanSessionTurns. The SDK unregisters
+// the in-flight turn when its stream unwinds, so a subsequent /stop reports
+// 'no in-flight turn' instead of cancelling a stale registration.
 func (b *Bot) handleStopCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	binding := b.State.GetBinding(i.ChannelID)
 	if binding == nil {
