@@ -2,11 +2,9 @@ module github.com/colinrgodsey/wackydiscord
 
 go 1.25.7
 
-replace github.com/colinrgodsey/wackypub => ../..
-
 require (
 	github.com/bwmarrin/discordgo v0.29.0
-	github.com/colinrgodsey/wackypub v0.0.0-20260817003406-6c2da863b9bd
+	github.com/colinrgodsey/wackypub v0.0.0-20260916234955-d8c2d2f62d8c
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/spf13/cobra v1.10.2
 	google.golang.org/genai v1.57.0
@@ -20,6 +18,7 @@ require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/ProtonMail/go-crypto v1.1.6 // indirect
 	github.com/achetronic/adk-utils-go v0.23.1-0.20260810132742-1f0a646bcdfd // indirect
+	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
 	github.com/anthropics/anthropic-sdk-go v1.61.0 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/buger/jsonparser v1.1.2 // indirect
