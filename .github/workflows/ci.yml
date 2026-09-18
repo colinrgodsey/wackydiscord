@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: # Allows you to run it manually
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build, vet, and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out wackypub (parent, carries the wackydiscord submodule)
+        uses: actions/checkout@v4
+
+      - name: Initialize submodules
+        run: |
+          git submodule update --init --recursive
+
+      - name: Check out the wackydiscord revision under test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tools/wackydiscord
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR: the merge ref of the head branch (what the PR would merge into main).
+            git fetch origin "${{ github.event.pull_request.head.sha }}"
+            git checkout "${{ github.event.pull_request.head.sha }}"
+          else
+            # push (main) or workflow_dispatch: the commit that triggered this run.
+            git fetch origin "${{ github.sha }}"
+            git checkout "${{ github.sha }}"
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.7'
+          cache: true
+
+      - name: Check formatting (gofmt)
+        working-directory: tools/wackydiscord
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Build
+        working-directory: tools/wackydiscord
+        run: go build ./...
+
+      - name: Vet
+        working-directory: tools/wackydiscord
+        run: go vet ./...
+
+      - name: Test (race detector enabled)
+        working-directory: tools/wackydiscord
+        run: go test ./... -race -count=1
