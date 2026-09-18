@@ -18,7 +18,13 @@ jobs:
       - name: Check out wackypub (parent, carries the wackydiscord submodule)
         uses: actions/checkout@v4
         with:
+          # This workflow lives in the wackydiscord repo, but a standalone wackydiscord
+          # checkout has no tools/wackydiscord submodule. Check out the PARENT repo so the
+          # .gitmodules entry exists, then re-point the submodule at the revision under test.
+          repository: colinrgodsey/wackypub
+          ref: main
           submodules: recursive
+          token: ${{ github.token }}
 
       - name: Check out the wackydiscord revision under test
         shell: bash
