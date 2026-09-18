@@ -17,24 +17,29 @@ jobs:
     steps:
       - name: Check out wackypub (parent, carries the wackydiscord submodule)
         uses: actions/checkout@v4
-
-      - name: Initialize submodules
-        run: |
-          git submodule update --init --recursive
+        with:
+          submodules: recursive
 
       - name: Check out the wackydiscord revision under test
         shell: bash
         run: |
           set -euo pipefail
+          # Defensive: the parent gitlink may point at a commit the shallow default
+          # checkout cannot resolve; force a scoped init before relying on the dir.
+          git submodule update --init -- tools/wackydiscord
+          if [ ! -d tools/wackydiscord ]; then
+            echo "tools/wackydiscord directory missing after submodule init" >&2
+            exit 1
+          fi
           cd tools/wackydiscord
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            # PR: the merge ref of the head branch (what the PR would merge into main).
+            # PR: the head sha of the pull request.
             git fetch origin "${{ github.event.pull_request.head.sha }}"
-            git checkout "${{ github.event.pull_request.head.sha }}"
+            git checkout --force "${{ github.event.pull_request.head.sha }}"
           else
-            # push (main) or workflow_dispatch: the commit that triggered this run.
+            # push (main) or workflow_dispatch: the triggering commit.
             git fetch origin "${{ github.sha }}"
-            git checkout "${{ github.sha }}"
+            git checkout --force "${{ github.sha }}"
           fi
 
       - name: Set up Go
