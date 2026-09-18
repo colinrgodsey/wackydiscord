@@ -291,6 +291,40 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		return 0, nil
 	}
 
+	// Echo-bug guard (claude diagnosis, 2026-09-17): a leading-edge sync can observe a
+	// user-only tail before the assistant response is written - the fsnotify event for the
+	// user turn fires while the handler is still generating. Rendering that tail as a
+	// standalone [User Turn] backfill echoes the user's own message back into the channel
+	// (the reported screenshot: the user text verbatim under a date-hook preamble). Defer
+	// the tail while IsGenerating is set; once a paired assistant turn exists (or generation
+	// clears), the next sync re-diffs it. When IsGenerating has cleared and no assistant
+	// arrived, the tail is a genuine orphan and renders per existing backfill semantics.
+	deferredTail := false
+	if bnd.IsGenerating && len(unsynced) > 0 {
+		if last := unsynced[len(unsynced)-1]; last.Role == "user" && !IsSyntheticHarnessTurn(last) && strings.TrimSpace(agent.ContentText(last)) != "" {
+			// Only a text-bearing user turn can echo back as a [User Turn] message. Tool-response
+			// turns share the user role but carry FunctionResponse parts with empty ContentText;
+			// deferring those would stall the tool-cycle watermark mid-generation.
+			deferredTail = true
+			unsynced = unsynced[:len(unsynced)-1]
+			// Do not advance the watermark past the deferred user turn; the next sync must
+			// re-see it (paired with its assistant, or orphaned after generation clears).
+			if newIdx-1 >= 0 {
+				newIdx = newIdx - 1
+				newHash = ComputeTurnHash(turns[newIdx])
+			} else {
+				newIdx = -1
+				newHash = ""
+			}
+		}
+	}
+	if deferredTail && len(unsynced) == 0 {
+		// Only the deferred tail was unsynced; nothing to render this pass and the
+		// watermark stays put so the next sync can pair or orphan it.
+		syncUnlock()
+		return 0, nil
+	}
+
 	type turnItem struct {
 		turn   *genai.Content
 		isEcho bool

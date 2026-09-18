@@ -15,6 +15,7 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/colinrgodsey/wackypub/pkg/agent"
+	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 )
 
 // TestSlashGate_StopBlockedForNonOwner verifies /stop is gated by the D102
@@ -125,11 +126,19 @@ func TestStopCommand_PartialCommitSessionState(t *testing.T) {
 	_ = os.Chdir(bobDir)
 	defer os.Chdir(origCwd)
 
+	stream := agent.NewInProcessStream[agentv1.AddAndGenerateTurnStreamResponse](context.Background(), 16)
 	streamDone := make(chan struct{})
 	go func() {
-		for range sdk.AddAndGenerateTurnStream(context.Background(), "bob", "Hello from the partial-commit test") {
-		}
+		defer stream.Close()
+		_ = sdk.AddAndGenerateTurnStream(&agentv1.AddAndGenerateTurnStreamRequest{
+			AgentId:     "bob",
+			UserMessage: "Hello from the partial-commit test",
+		}, stream)
 		close(streamDone)
+	}()
+	go func() {
+		for range stream.Chunks() {
+		}
 	}()
 
 	select {

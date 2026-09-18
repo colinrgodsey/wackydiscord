@@ -642,3 +642,186 @@ func TestWatcher_ConcurrentSyncDoesNotEchoOrDoubleRender(t *testing.T) {
 		t.Errorf("expected assistant output to be rendered exactly once, got %d times (msgs: %v)", modelMsgCount, msgs)
 	}
 }
+
+// TestWatcher_UserOnlyTurnDeferredWhileGenerating is the regression guard for the echo
+// bug (2026-09-17): a leading-edge sync fired while IsGenerating is set sees only the
+// freshly-appended user turn (the assistant response has not arrived), and previously
+// rendered it as a standalone [User Turn] backfill - echoing the user's own message into
+// the channel. The guard defers that trailing user turn: nothing is posted until a paired
+// assistant turn exists, and the sync watermark stays put so the next sync re-diffs it.
+func TestWatcher_UserOnlyTurnDeferredWhileGenerating(t *testing.T) {
+	b, agentDir, st := setupTestBot(t, "echo_guard_agent")
+
+	var mu sync.Mutex
+	var sentMessages []string
+	s := createMockDiscordSession(&mu, &sentMessages)
+	b.Session = s
+
+	channelID := "chan_echo_guard"
+
+	// Seed a prior turn so the appended user turn actually diff as unsynced; a binding
+	// with no history takes DiffUnsyncedTurns Case 1 which records markers but never
+	// surfaces unsynced content, so the deferred-tail guard would not be exercised.
+	priorTurn := genai.NewContentFromText("System init", "user")
+	if err := agent.AppendSessionContent(agentDir, priorTurn); err != nil {
+		t.Fatalf("AppendSessionContent priorTurn failed: %v", err)
+	}
+	priorHash := ComputeTurnHash(priorTurn)
+
+	binding := &ChannelBinding{
+		ChannelID:     channelID,
+		AgentID:       "echo_guard_agent",
+		LastTurnIndex: 0,
+		LastTurnHash:  priorHash,
+		IsGenerating:  true, // The turn is mid-generation; the watcher must not echo the user turn.
+	}
+	if err := st.SetBinding(binding); err != nil {
+		t.Fatalf("SetBinding failed: %v", err)
+	}
+
+	userMsgText := "Merge the wackyacp PR please."
+	userTurn := genai.NewContentFromText(userMsgText, "user")
+	if err := agent.AppendSessionContent(agentDir, userTurn); err != nil {
+		t.Fatalf("AppendSessionContent userTurn failed: %v", err)
+	}
+
+	// Leading-edge sync: exactly the fsnotify-backed call that used to echo the user turn.
+	b.SyncAgentToChannels("echo_guard_agent")
+
+	mu.Lock()
+	early := append([]string{}, sentMessages...)
+	mu.Unlock()
+	for _, m := range early {
+		if strings.Contains(m, "User Turn") || strings.Contains(m, userMsgText) {
+			t.Fatalf("leading-edge sync echoed the user turn: %q", m)
+		}
+	}
+
+	// Watermark must NOT have advanced past the deferred user turn; a later sync must
+	// re-see it once the assistant turn exists.
+	bnd := st.GetBinding(channelID)
+	if bnd == nil {
+		t.Fatal("binding missing after sync")
+	}
+	if bnd.LastTurnIndex != 0 {
+		t.Fatalf("watermark advanced to %d while the user turn was deferred, want 0 (prior turn)", bnd.LastTurnIndex)
+	}
+
+	// The handler's post-AddUserTurn registration lands (it closed the race window right
+	// after the user turn write). Register the user turn's actual hash as pending so the
+	// real flow's echo-suppression consumes it on the next sync.
+	fresh := st.GetBinding(channelID)
+	fresh.AddPendingUserHash(ComputeTurnHash(userTurn))
+	fresh.IsGenerating = true
+	if err := st.SetBinding(fresh); err != nil {
+		t.Fatalf("SetBinding after pending-hash registration: %v", err)
+	}
+
+	// Now the assistant response arrives; IsGenerating clears.
+	modelTurn := genai.NewContentFromText("Merged. sha 1234abc.", "model")
+	if err := agent.AppendSessionContent(agentDir, modelTurn); err != nil {
+		t.Fatalf("AppendSessionContent modelTurn failed: %v", err)
+	}
+	fresh = st.GetBinding(channelID)
+	fresh.IsGenerating = false
+	if err := st.SetBinding(fresh); err != nil {
+		t.Fatalf("SetBinding after generating cleared: %v", err)
+	}
+
+	b.SyncAgentToChannels("echo_guard_agent")
+
+	mu.Lock()
+	later := append([]string{}, sentMessages...)
+	mu.Unlock()
+
+	var sawUser, sawAssistant bool
+	for _, m := range later {
+		if strings.Contains(m, "User Turn") || (strings.Contains(m, userMsgText) && !strings.Contains(m, "Merged")) {
+			sawUser = true
+		}
+		if strings.Contains(m, "Merged. sha 1234abc.") {
+			sawAssistant = true
+		}
+	}
+	if sawUser {
+		t.Error("user turn was rendered as its own message even after the assistant arrived")
+	}
+	if !sawAssistant {
+		t.Error("assistant turn was not rendered after generation completed")
+	}
+
+	bnd = st.GetBinding(channelID)
+	if bnd == nil {
+		t.Fatal("binding missing after second sync")
+	}
+	if bnd.LastTurnIndex != 2 {
+		t.Fatalf("watermark = %d after paired render, want 2", bnd.LastTurnIndex)
+	}
+}
+
+// TestWatcher_OrphanedUserTurnRendersAfterGenerationSettles pins the decision for a
+// genuinely orphaned user turn (a user turn with no assistant, after generation has
+// cleared): it renders per existing backfill semantics (FormatUserBackfillMessage) - the
+// guard's job is to defer the LEADING-EDGE echo, not to suppress real orphan backfills.
+// This mirrors the brief: defer until a paired assistant exists OR the debounce window
+// elapses with no assistant; once IsGenerating clears, the orphan surfaces normally.
+func TestWatcher_OrphanedUserTurnRendersAfterGenerationSettles(t *testing.T) {
+	b, agentDir, st := setupTestBot(t, "orphan_agent")
+
+	var mu sync.Mutex
+	var sentMessages []string
+	s := createMockDiscordSession(&mu, &sentMessages)
+	b.Session = s
+
+	channelID := "chan_orphan"
+
+	// Seed a prior turn so the orphan user turn diffs as unsynced (a fresh binding would
+	// take DiffUnsyncedTurns Case 1 and never surface anything, which would not exercise
+	// the guard or the orphan decision).
+	priorTurn := genai.NewContentFromText("System init", "user")
+	if err := agent.AppendSessionContent(agentDir, priorTurn); err != nil {
+		t.Fatalf("AppendSessionContent priorTurn failed: %v", err)
+	}
+	priorHash := ComputeTurnHash(priorTurn)
+
+	binding := &ChannelBinding{
+		ChannelID:     channelID,
+		AgentID:       "orphan_agent",
+		LastTurnIndex: 0,
+		LastTurnHash:  priorHash,
+		IsGenerating:  false, // generation confirmed absent; this turn is a genuine orphan
+	}
+	if err := st.SetBinding(binding); err != nil {
+		t.Fatalf("SetBinding failed: %v", err)
+	}
+
+	userMsgText := "unpaired user text"
+	userTurn := genai.NewContentFromText(userMsgText, "user")
+	if err := agent.AppendSessionContent(agentDir, userTurn); err != nil {
+		t.Fatalf("AppendSessionContent userTurn failed: %v", err)
+	}
+
+	b.SyncAgentToChannels("orphan_agent")
+
+	mu.Lock()
+	msgs := append([]string{}, sentMessages...)
+	mu.Unlock()
+
+	var sawBackfill bool
+	for _, m := range msgs {
+		if strings.Contains(m, "User Turn") || strings.Contains(m, userMsgText) {
+			sawBackfill = true
+		}
+	}
+	if !sawBackfill {
+		t.Error("orphaned user turn was not backfilled after generation settled; expected existing semantics to render it")
+	}
+
+	bnd := st.GetBinding(channelID)
+	if bnd == nil {
+		t.Fatal("binding missing after sync")
+	}
+	if bnd.LastTurnIndex != 1 {
+		t.Fatalf("watermark = %d after orphan backfill, want 1", bnd.LastTurnIndex)
+	}
+}
