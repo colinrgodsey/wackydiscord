@@ -66,6 +66,18 @@ var SlashCommands = []*discordgo.ApplicationCommand{
 		Description: "Cancel the in-flight turn of the bound agent",
 	},
 	{
+		Name:        "compact",
+		Description: "Archive the bound agent's oldest session turns into MEMORY.md",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Type:        discordgo.ApplicationCommandOptionBoolean,
+				Name:        "force",
+				Description: "Archive turns even when the session is still under the compaction threshold",
+				Required:    false,
+			},
+		},
+	},
+	{
 		Name:        "claim",
 		Description: "Claim ownership of this bot instance",
 	},
@@ -136,6 +148,8 @@ func (b *Bot) HandleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 		b.handleAgentsCommand(s, i)
 	case "stop":
 		b.handleStopCommand(s, i)
+	case "compact":
+		b.handleCompactCommand(s, i)
 	}
 }
 
@@ -539,4 +553,118 @@ func (b *Bot) editInteractionResponse(s *discordgo.Session, i *discordgo.Interac
 	_, _ = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 		Content: &message,
 	})
+}
+
+// handleCompactCommand archives the bound agent's oldest turns into MEMORY.md. The D44
+// gates stay in charge unless the caller passes force, and either way the reply states what
+// happened: a skipped compaction is otherwise indistinguishable from a command that did
+// nothing at all.
+func (b *Bot) handleCompactCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	binding := b.State.GetBinding(i.ChannelID)
+	if binding == nil {
+		b.respondInteraction(s, i, "❌ This channel is not bound to any agent. Use `/bind <agent_id>` first.", true)
+		return
+	}
+
+	// Compaction rewrites session.jsonl, which the runner is appending to. The session lock
+	// would serialize it anyway, but a long generation would leave the caller staring at a
+	// deferred Discord message, so this rejects cleanly instead of waiting.
+	if binding.IsGenerating {
+		b.respondInteraction(s, i, "⚠️ Agent is currently generating; wait for the turn to finish before running `/compact`.", true)
+		return
+	}
+
+	force := false
+	for _, opt := range i.ApplicationCommandData().Options {
+		// BoolValue panics on an option of another type, and the payload is Discord-supplied.
+		if opt.Name == "force" && opt.Type == discordgo.ApplicationCommandOptionBoolean {
+			force = opt.BoolValue()
+		}
+	}
+
+	// Summarizing turns is a model call, so it does not fit inside Discord's interaction window.
+	if s != nil && i != nil && i.Interaction != nil {
+		_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		})
+	}
+
+	// Resolved rather than called on the SDK directly, so a channel bound to a routed agent
+	// sends compaction to the bridge that owns the session instead of hunting for a local one.
+	client, cleanup, err := agent.ResolveAgentClient(context.Background(), b.SDK, binding.AgentID)
+	if err != nil {
+		b.editInteractionResponse(s, i, fmt.Sprintf("❌ Could not reach agent **%s**: %v", binding.AgentID, err))
+		return
+	}
+	defer cleanup()
+
+	before := b.sessionContextSnapshot(binding.AgentID)
+
+	resp, err := client.CompactSession(context.Background(), &agentv1.CompactSessionRequest{
+		AgentId:      binding.AgentID,
+		Force:        force,
+		WorkspaceDir: b.WsDir,
+	})
+	if err != nil {
+		b.editInteractionResponse(s, i, fmt.Sprintf("❌ Compaction failed for **%s**: %v", binding.AgentID, err))
+		return
+	}
+	if resp == nil {
+		b.editInteractionResponse(s, i, fmt.Sprintf("❌ Compaction returned no result for **%s**.", binding.AgentID))
+		return
+	}
+
+	if !resp.GetCompacted() {
+		b.editInteractionResponse(s, i, compactSkippedMessage(binding.AgentID, before, force))
+		return
+	}
+	b.editInteractionResponse(s, i, compactedMessage(binding.AgentID, before, b.sessionContextSnapshot(binding.AgentID)))
+}
+
+// sessionContextSnapshot decorates a compaction reply with turn and token counts. Errors
+// become nil: the verdict comes from the RPC, these numbers only explain it.
+func (b *Bot) sessionContextSnapshot(agentID string) *agentv1.InspectSessionContextResponse {
+	resp, err := b.SDK.InspectSessionContext(context.Background(), &agentv1.InspectSessionContextRequest{
+		AgentId:      agentID,
+		WorkspaceDir: b.WsDir,
+	})
+	if err != nil {
+		return nil
+	}
+	return resp
+}
+
+func compactedMessage(agentID string, before, after *agentv1.InspectSessionContextResponse) string {
+	archived := before.GetTurnCount() - after.GetTurnCount()
+	if archived > 0 {
+		unit := "turns"
+		if archived == 1 {
+			unit = "turn"
+		}
+		return fmt.Sprintf(
+			"🗜️ **Compacted %s**: archived %d %s (%d to %d). The next turn starts with the compacted context.",
+			agentID, archived, unit, before.GetTurnCount(), after.GetTurnCount(),
+		)
+	}
+	// A routed agent keeps its session behind its bridge, so there are no local counts to quote.
+	return fmt.Sprintf("🗜️ **Compacted %s**. The next turn starts with the compacted context.", agentID)
+}
+
+// compactSkippedMessage names the gate that refused, because a bare no is what sends an
+// operator to the logs.
+func compactSkippedMessage(agentID string, before *agentv1.InspectSessionContextResponse, force bool) string {
+	if before == nil || before.GetTurnCount() == 0 {
+		return fmt.Sprintf("ℹ️ Nothing to compact for **%s**: no session turns to archive.", agentID)
+	}
+	if force {
+		return fmt.Sprintf("ℹ️ Compaction was forced for **%s** and archived nothing.", agentID)
+	}
+	return fmt.Sprintf(
+		"ℹ️ Nothing to compact for **%s** yet: %d of %d tokens (%.0f%% of the compaction threshold) across %d turns. Use `/compact force:true` to archive anyway.",
+		agentID,
+		before.GetEstimatedTotalTokens(),
+		before.GetCompactionThreshold(),
+		before.GetPercentToThreshold(),
+		before.GetTurnCount(),
+	)
 }
