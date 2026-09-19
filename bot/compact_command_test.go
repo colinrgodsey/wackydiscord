@@ -37,8 +37,21 @@ func (s *compactSpy) snapshot() (int, discordgo.InteractionResponseType, string,
 func setupCompactBot(t *testing.T, runtimeJSON string) (*Bot, *compactSpy, string) {
 	t.Helper()
 
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
 	ws := t.TempDir()
 	_ = os.WriteFile(filepath.Join(ws, "WACKYPUB_ROOT"), []byte(""), 0644)
+	_ = os.WriteFile(filepath.Join(ws, agent.AllowedAgentsFile), []byte("bob\n"), 0644)
+
+	// The A2A authorization check walks up from the process working directory, so leaving it
+	// wherever go test started would pass or fail on whichever WACKYPUB_ROOT or
+	// WACKYPUB_ALLOWED_AGENTS happens to sit above the checkout. Pin it to this fixture.
+	if err := os.Chdir(ws); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
 	agentDir := filepath.Join(ws, "bob")
 	if err := os.MkdirAll(agentDir, 0755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
