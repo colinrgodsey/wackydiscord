@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: # Allows you to run it manually
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build, vet, and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out wackypub (parent, carries the wackydiscord submodule)
+        uses: actions/checkout@v4
+        with:
+          # This workflow lives in the wackydiscord repo, but a standalone wackydiscord
+          # checkout has no tools/wackydiscord submodule. Check out the PARENT repo so the
+          # .gitmodules entry exists, then re-point the submodule at the revision under test.
+          repository: colinrgodsey/wackypub
+          ref: main
+          submodules: recursive
+          token: ${{ github.token }}
+
+      - name: Check out the wackydiscord revision under test
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Defensive: the parent gitlink may point at a commit the shallow default
+          # checkout cannot resolve; force a scoped init before relying on the dir.
+          git submodule update --init -- tools/wackydiscord
+          if [ ! -d tools/wackydiscord ]; then
+            echo "tools/wackydiscord directory missing after submodule init" >&2
+            exit 1
+          fi
+          cd tools/wackydiscord
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR: the head sha of the pull request.
+            git fetch origin "${{ github.event.pull_request.head.sha }}"
+            git checkout --force "${{ github.event.pull_request.head.sha }}"
+          else
+            # push (main) or workflow_dispatch: the triggering commit.
+            git fetch origin "${{ github.sha }}"
+            git checkout --force "${{ github.sha }}"
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.7'
+          cache: true
+
+      - name: Check formatting (gofmt)
+        working-directory: tools/wackydiscord
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Build
+        working-directory: tools/wackydiscord
+        run: go build ./...
+
+      - name: Vet
+        working-directory: tools/wackydiscord
+        run: go vet ./...
+
+      - name: Test (race detector enabled)
+        working-directory: tools/wackydiscord
+        run: go test ./... -race -count=1
