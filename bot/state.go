@@ -109,6 +109,14 @@ func NewState(filePath string) (*State, error) {
 		agentAsideMu: make(map[string]*sync.Mutex),
 	}
 
+	// A state file written by an older build is 0644 and therefore already exposed. Tighten it
+	// on load rather than waiting for the next write, which may never happen on a quiet
+	// instance. A failure is logged and not fatal: on a filesystem that cannot carry the mode,
+	// refusing to start would remove no exposure and would take the bot down.
+	if err := os.Chmod(filePath, 0600); err != nil && !os.IsNotExist(err) {
+		log.Printf("⚠️ could not restrict permissions on %s: %v", filePath, err)
+	}
+
 	if data, err := os.ReadFile(filePath); err == nil {
 		var loaded struct {
 			ClaimedUserID string                     `json:"claimed_user_id,omitempty"`
@@ -293,7 +301,9 @@ func (s *State) saveLocked() error {
 	}
 
 	tmpFile := fmt.Sprintf("%s.tmp.%d", s.filePath, os.Getpid())
-	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+	// The state file stores Discord webhook tokens, which authorize posting to a channel as
+	// the bot's persona, so it must not be group- or world-readable.
+	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
 		return fmt.Errorf("failed to write temp state file: %w", err)
 	}
 
