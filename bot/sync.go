@@ -213,7 +213,12 @@ func FormatToolTurnSummary(turn *genai.Content) string {
 		if p.FunctionCall != nil {
 			argsBytes, err := json.MarshalIndent(p.FunctionCall.Args, "", "  ")
 			if err != nil {
-				argsBytes, _ = json.Marshal(p.FunctionCall.Args)
+				if argsBytes, err = json.Marshal(p.FunctionCall.Args); err != nil {
+					// Both marshal attempts failed identically (the value itself is
+					// unmarshalable), so fall back to a Go-syntax rendering rather than
+					// silently showing empty arguments, which reads as "called with none".
+					argsBytes = []byte(fmt.Sprintf("%v", p.FunctionCall.Args))
+				}
 			}
 			argsStr := string(argsBytes)
 			if len(argsStr) > 1200 {
@@ -232,7 +237,11 @@ func FormatToolTurnSummary(turn *genai.Content) string {
 				} else {
 					respBytes, err := json.MarshalIndent(p.FunctionResponse.Response, "", "  ")
 					if err != nil {
-						respBytes, _ = json.Marshal(p.FunctionResponse.Response)
+						if respBytes, err = json.Marshal(p.FunctionResponse.Response); err != nil {
+							// Same fallback as the tool-call args above: survive in some
+							// shape rather than silently rendering an empty response.
+							respBytes = []byte(fmt.Sprintf("%v", p.FunctionResponse.Response))
+						}
 					}
 					summary := string(respBytes)
 					if len(summary) > 1200 {

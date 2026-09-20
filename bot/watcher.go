@@ -62,7 +62,9 @@ func (sw *SessionWatcher) Start(ctx context.Context) {
 	bindings := sw.bot.State.GetAllBindings()
 	for _, b := range bindings {
 		if b.AgentID != "" {
-			_ = sw.WatchAgent(b.AgentID)
+			if err := sw.WatchAgent(b.AgentID); err != nil {
+				log.Printf("⚠️ failed to watch agent %q for live session updates: %v", b.AgentID, err)
+			}
 		}
 	}
 
@@ -120,7 +122,9 @@ func (sw *SessionWatcher) UnwatchAgent(agentID string) {
 		delete(sw.trackers, agentID)
 	}
 
-	_ = sw.watcher.Remove(agentDir)
+	if err := sw.watcher.Remove(agentDir); err != nil {
+		log.Printf("⚠️ failed to remove filesystem watch for %s: %v", agentDir, err)
+	}
 	delete(sw.watchedDirs, agentDir)
 	log.Printf("Unwatched agent directory: %s", agentDir)
 }
@@ -209,35 +213,34 @@ func (sw *SessionWatcher) debounceAgentSync(agentID string) {
 	})
 }
 
-func (sw *SessionWatcher) flushAgentSync(agentID string) {
+// cancelPendingSync stops and clears agentID's debounce tracker, if one exists, and reports
+// whether one was found. Shared by flushAgentSync and FlushNow, which differ only in what
+// triggers the flush (a fired timer vs. an explicit caller) - both cancel the same pending
+// state and then call SyncAgentToChannels themselves.
+func (sw *SessionWatcher) cancelPendingSync(agentID string) bool {
 	sw.mu.Lock()
-	if tr, exists := sw.trackers[agentID]; exists {
-		if tr.timer != nil {
-			tr.timer.Stop()
-		}
-		if tr.maxTimer != nil {
-			tr.maxTimer.Stop()
-		}
-		delete(sw.trackers, agentID)
+	defer sw.mu.Unlock()
+	tr, exists := sw.trackers[agentID]
+	if !exists {
+		return false
 	}
-	sw.mu.Unlock()
+	if tr.timer != nil {
+		tr.timer.Stop()
+	}
+	if tr.maxTimer != nil {
+		tr.maxTimer.Stop()
+	}
+	delete(sw.trackers, agentID)
+	return true
+}
 
+func (sw *SessionWatcher) flushAgentSync(agentID string) {
+	sw.cancelPendingSync(agentID)
 	sw.bot.SyncAgentToChannels(agentID)
 }
 
 // FlushNow cancels pending debounce timers for agentID and synchronously calls SyncAgentToChannels immediately.
 func (sw *SessionWatcher) FlushNow(agentID string) {
-	sw.mu.Lock()
-	if tr, exists := sw.trackers[agentID]; exists {
-		if tr.timer != nil {
-			tr.timer.Stop()
-		}
-		if tr.maxTimer != nil {
-			tr.maxTimer.Stop()
-		}
-		delete(sw.trackers, agentID)
-	}
-	sw.mu.Unlock()
-
+	sw.cancelPendingSync(agentID)
 	sw.bot.SyncAgentToChannels(agentID)
 }

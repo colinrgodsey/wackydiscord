@@ -100,10 +100,7 @@ func IsInlineText(filename string, data []byte) bool {
 		prefix = prefix[:512]
 	}
 	mime := http.DetectContentType(prefix)
-	if !strings.HasPrefix(mime, "text/") {
-		return false
-	}
-	return true
+	return strings.HasPrefix(mime, "text/")
 }
 
 // fenceLang maps a file extension to a markdown code fence language identifier.

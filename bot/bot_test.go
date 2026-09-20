@@ -152,7 +152,7 @@ func TestStatePersistenceAndConcurrency(t *testing.T) {
 	}
 }
 
-func TestState_LockChannel(t *testing.T) {
+func TestState_ChannelLocks(t *testing.T) {
 	st, err := NewState(filepath.Join(t.TempDir(), ".wackydiscord.json"))
 	if err != nil {
 		t.Fatalf("NewState failed: %v", err)

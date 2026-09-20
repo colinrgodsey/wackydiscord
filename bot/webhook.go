@@ -2,6 +2,7 @@ package bot
 
 import (
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/bwmarrin/discordgo"
@@ -92,4 +93,15 @@ func SendAgentMessage(s *discordgo.Session, channelID string, agentID string, co
 	}
 
 	return nil
+}
+
+// say sends an agent message and logs any failure with channel context, so a failed reply
+// or notice is never silently invisible. Call sites genuinely cannot recover from a delivery
+// failure (there is nothing left to retry or fall back to at that point), so this keeps them
+// as one-line statements while making the loss visible - the house rule is handle or return,
+// never drop a caught error without a trace.
+func (b *Bot) say(s *discordgo.Session, channelID, speaker, content string, wh *discordgo.Webhook) {
+	if err := SendAgentMessage(s, channelID, speaker, content, wh); err != nil {
+		log.Printf("⚠️ send to channel %s failed (%d chars, speaker %s): %v", channelID, len(content), speaker, err)
+	}
 }

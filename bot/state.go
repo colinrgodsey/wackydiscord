@@ -3,6 +3,7 @@ package bot
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,17 +130,21 @@ func NewState(filePath string) (*State, error) {
 	return s, nil
 }
 
-// LockChannelTurn acquires the generation-turn mutex for the specified channelID.
-// It serializes user prompt generation dispatches so multiple turns don't collide.
-func (s *State) LockChannelTurn(channelID string) func() {
+// channelLock is the shared implementation behind LockChannelTurn, LockChannelSync and
+// LockChannelDrain, which differ only in which per-channel mutex map they use. It takes the
+// map lock, lazily initializes *m, fetches or creates the channel's mutex, then releases the
+// map lock BEFORE locking the per-channel mutex - the map lock must never be held across the
+// per-channel Lock() call below, since that call can block for as long as the previous
+// holder's critical section runs.
+func (s *State) channelLock(m *map[string]*sync.Mutex, channelID string) func() {
 	s.chanLocksMu.Lock()
-	if s.chanTurnMu == nil {
-		s.chanTurnMu = make(map[string]*sync.Mutex)
+	if *m == nil {
+		*m = make(map[string]*sync.Mutex)
 	}
-	mu, ok := s.chanTurnMu[channelID]
+	mu, ok := (*m)[channelID]
 	if !ok {
 		mu = &sync.Mutex{}
-		s.chanTurnMu[channelID] = mu
+		(*m)[channelID] = mu
 	}
 	s.chanLocksMu.Unlock()
 
@@ -147,52 +152,24 @@ func (s *State) LockChannelTurn(channelID string) func() {
 	return func() {
 		mu.Unlock()
 	}
+}
+
+// LockChannelTurn acquires the generation-turn mutex for the specified channelID.
+// It serializes user prompt generation dispatches so multiple turns don't collide.
+func (s *State) LockChannelTurn(channelID string) func() {
+	return s.channelLock(&s.chanTurnMu, channelID)
 }
 
 // LockChannelSync acquires the short-lived sync mutex for the specified channelID.
 // Held only for brief memory updates (<= 1ms) during ChannelBinding read-modify-write sequences.
 func (s *State) LockChannelSync(channelID string) func() {
-	s.chanLocksMu.Lock()
-	if s.chanSyncMu == nil {
-		s.chanSyncMu = make(map[string]*sync.Mutex)
-	}
-	mu, ok := s.chanSyncMu[channelID]
-	if !ok {
-		mu = &sync.Mutex{}
-		s.chanSyncMu[channelID] = mu
-	}
-	s.chanLocksMu.Unlock()
-
-	mu.Lock()
-	return func() {
-		mu.Unlock()
-	}
+	return s.channelLock(&s.chanSyncMu, channelID)
 }
 
 // LockChannelDrain acquires the send-drain mutex for the specified channelID.
 // It serializes Discord message sending across concurrent sync passes.
 func (s *State) LockChannelDrain(channelID string) func() {
-	s.chanLocksMu.Lock()
-	if s.chanDrainMu == nil {
-		s.chanDrainMu = make(map[string]*sync.Mutex)
-	}
-	mu, ok := s.chanDrainMu[channelID]
-	if !ok {
-		mu = &sync.Mutex{}
-		s.chanDrainMu[channelID] = mu
-	}
-	s.chanLocksMu.Unlock()
-
-	mu.Lock()
-	return func() {
-		mu.Unlock()
-	}
-}
-
-// LockChannel is deprecated: use LockChannelSync or LockChannelTurn directly.
-// It forwards to LockChannelSync for backwards compatibility.
-func (s *State) LockChannel(channelID string) func() {
-	return s.LockChannelSync(channelID)
+	return s.channelLock(&s.chanDrainMu, channelID)
 }
 
 // GetBinding retrieves the binding for a channel, returning nil if unbound.
@@ -293,7 +270,11 @@ func (s *State) saveLocked() error {
 	}
 
 	if err := os.Rename(tmpFile, s.filePath); err != nil {
-		_ = os.Remove(tmpFile)
+		if rmErr := os.Remove(tmpFile); rmErr != nil {
+			// Best-effort cleanup: the rename already failed, so this only affects whether
+			// a stale temp file accumulates in the workspace directory, not correctness.
+			log.Printf("⚠️ failed to remove stale temp state file %s: %v", tmpFile, rmErr)
+		}
 		return fmt.Errorf("failed to commit state file: %w", err)
 	}
 
