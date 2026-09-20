@@ -42,11 +42,11 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 	// Verify bound agent exists and has valid configuration
 	insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID})
 	if err != nil || insp == nil || !insp.GetAgentDirExists() {
-		_ = SendAgentMessage(s, m.ChannelID, "System", fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`. Use `/bind <agent_id>` to connect a valid agent.", binding.AgentID, b.WsDir), nil)
+		b.say(s, m.ChannelID, "System", fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`. Use `/bind <agent_id>` to connect a valid agent.", binding.AgentID, b.WsDir), nil)
 		return
 	}
 	if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
-		_ = SendAgentMessage(s, m.ChannelID, "System", fmt.Sprintf("⚠️ **Agent Configuration Error:** Agent %q has an invalid `runtime.json`: %s", binding.AgentID, insp.GetRuntimeJsonError()), nil)
+		b.say(s, m.ChannelID, "System", fmt.Sprintf("⚠️ **Agent Configuration Error:** Agent %q has an invalid `runtime.json`: %s", binding.AgentID, insp.GetRuntimeJsonError()), nil)
 		return
 	}
 
@@ -68,7 +68,7 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		attResult, _ := b.ProcessAttachments(attCtx, binding.AgentID, m.Attachments)
 		if attResult != nil {
 			for _, notice := range attResult.Notices {
-				_ = SendAgentMessage(s, m.ChannelID, "System", notice, nil)
+				b.say(s, m.ChannelID, "System", notice, nil)
 			}
 			if attResult.PromptText != "" {
 				if userText != "" {
@@ -134,7 +134,7 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		Message: userText,
 	})
 	if addErr != nil {
-		_ = SendAgentMessage(s, m.ChannelID, "System", fmt.Sprintf("❌ **Turn error:** %v", addErr), nil)
+		b.say(s, m.ChannelID, "System", fmt.Sprintf("❌ **Turn error:** %v", addErr), nil)
 		return
 	}
 
@@ -194,6 +194,10 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 				if bnd := b.State.GetBinding(m.ChannelID); bnd != nil && bnd.AgentID == binding.AgentID {
 					bnd.WebhookID = newWH.ID
 					bnd.WebhookToken = newWH.Token
+					// Best-effort cache of the resolved webhook: in-memory state is what
+					// gates behavior, and NewState resets IsGenerating on load (state.go),
+					// so losing only this persist just costs one extra EnsureWebhook call
+					// next turn - unlike a SetBinding failure elsewhere, this one is tolerable.
 					_ = b.State.SetBinding(bnd)
 				}
 			}()
@@ -233,10 +237,10 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 
 	if streamErr != nil {
 		if errors.Is(streamErr, context.Canceled) || strings.Contains(streamErr.Error(), "context canceled") {
-			_ = SendAgentMessage(s, m.ChannelID, "System", "⏹️ Turn stopped.", nil)
+			b.say(s, m.ChannelID, "System", "⏹️ Turn stopped.", nil)
 			return
 		}
-		_ = SendAgentMessage(s, m.ChannelID, "System", fmt.Sprintf("❌ **Agent error:** %v", streamErr), nil)
+		b.say(s, m.ChannelID, "System", fmt.Sprintf("❌ **Agent error:** %v", streamErr), nil)
 		return
 	}
 }
@@ -373,7 +377,7 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		toolSummaries = nil
 		chunks := SplitDiscordMessage(combined, MaxDiscordMessageLength)
 		for _, chunk := range chunks {
-			_ = SendAgentMessage(s, channelID, "Tools", chunk, nil)
+			b.say(s, channelID, "Tools", chunk, nil)
 		}
 	}
 
@@ -389,7 +393,7 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 			if verbose {
 				badge := FormatSyntheticHarnessTurn(turn)
 				if badge != "" {
-					_ = SendAgentMessage(s, channelID, "System", badge, nil)
+					b.say(s, channelID, "System", badge, nil)
 				}
 			}
 			continue
@@ -404,14 +408,14 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 			text := FormatUserBackfillMessage(turn)
 			if text != "" {
 				flushToolBatch()
-				_ = SendAgentMessage(s, channelID, "User", text, nil)
+				b.say(s, channelID, "User", text, nil)
 			}
 		} else {
 			text := FormatAssistantBackfillMessage(turn)
 			if text != "" {
 				flushToolBatch()
 				text = ExpandScratchpadSentinels(b.SDK, agentID, text)
-				_ = SendAgentMessage(s, channelID, agentID, text, wh)
+				b.say(s, channelID, agentID, text, wh)
 			}
 		}
 	}

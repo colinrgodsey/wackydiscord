@@ -152,7 +152,7 @@ func TestStatePersistenceAndConcurrency(t *testing.T) {
 	}
 }
 
-func TestState_LockChannel(t *testing.T) {
+func TestState_ChannelLocks(t *testing.T) {
 	st, err := NewState(filepath.Join(t.TempDir(), ".wackydiscord.json"))
 	if err != nil {
 		t.Fatalf("NewState failed: %v", err)
@@ -1043,6 +1043,21 @@ func TestHandleBindCommand_Locking(t *testing.T) {
 		t.Fatalf("failed writing AGENTS.md: %v", err)
 	}
 
+	// AuthorizeAgentTarget (behind ReadSession) walks up from the process's actual CWD
+	// looking for WACKYPUB_ROOT/WACKYPUB_ALLOWED_AGENTS, not from WsDir. The WACKYPUB_ROOT
+	// marker written above is inert unless the process is actually inside tmpDir - without
+	// this Chdir, whether the bind succeeds depends on whatever happens to sit above the
+	// test binary's ambient working directory (harmless locally, but this is exactly what
+	// went red in CI's parent-checkout layout).
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd failed: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("Chdir failed: %v", err)
+	}
+	defer os.Chdir(origCwd)
+
 	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
 	st, err := NewState(stateFile)
 	if err != nil {
@@ -1101,6 +1116,75 @@ func TestHandleBindCommand_Locking(t *testing.T) {
 
 	if st.GetBinding(channelID) == nil {
 		t.Errorf("expected %s to be bound to bob", channelID)
+	}
+}
+
+// TestHandleBindCommand_RejectsBindOnReadSessionError pins the fix for
+// bind-ignores-session-read-error: a failed ReadSession must refuse the bind rather than
+// seed an empty sync baseline (lastIdx -1), which would be indistinguishable from "nothing
+// synced yet" and cause the next sync pass to replay the whole session into the channel.
+// ReadSession fails here via a WACKYPUB_ALLOWED_AGENTS allowlist that does not list "bob" -
+// a deterministic, environment-independent way to fail AuthorizeAgentTarget without relying
+// on ambient filesystem state above the test's own tmpDir.
+func TestHandleBindCommand_RejectsBindOnReadSessionError(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	bobDir := filepath.Join(tmpDir, "bob")
+	if err := os.MkdirAll(bobDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bobDir, "AGENTS.md"), []byte("Prompt"), 0644); err != nil {
+		t.Fatalf("failed writing AGENTS.md: %v", err)
+	}
+
+	// Deliberately no WACKYPUB_ROOT at tmpDir: AuthorizeAgentTarget checks for the root
+	// marker before the allowlist at each directory, and finding one first would skip the
+	// allowlist check entirely, making the bind succeed instead of exercising this path.
+	allowlistPath := filepath.Join(tmpDir, "WACKYPUB_ALLOWED_AGENTS")
+	if err := os.WriteFile(allowlistPath, []byte("someone-else\n"), 0644); err != nil {
+		t.Fatalf("failed writing WACKYPUB_ALLOWED_AGENTS: %v", err)
+	}
+
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd failed: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("Chdir failed: %v", err)
+	}
+	defer os.Chdir(origCwd)
+
+	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
+	st, err := NewState(stateFile)
+	if err != nil {
+		t.Fatalf("NewState failed: %v", err)
+	}
+
+	b := &Bot{
+		WsDir: tmpDir,
+		State: st,
+		SDK:   agent.NewSDK(tmpDir),
+	}
+
+	channelID := "chan_bind_rejected"
+	b.handleBindCommand(nil, &discordgo.InteractionCreate{
+		Interaction: &discordgo.Interaction{
+			ChannelID: channelID,
+			Type:      discordgo.InteractionApplicationCommand,
+			Data: discordgo.ApplicationCommandInteractionData{
+				Options: []*discordgo.ApplicationCommandInteractionDataOption{
+					{
+						Name:  "agent",
+						Value: "bob",
+						Type:  discordgo.ApplicationCommandOptionString,
+					},
+				},
+			},
+		},
+	})
+
+	if binding := st.GetBinding(channelID); binding != nil {
+		t.Fatalf("expected no binding after a failed ReadSession, got %+v", binding)
 	}
 }
 

@@ -61,7 +61,12 @@ func NewBot(cfg Config) (*Bot, error) {
 		statePath = filepath.Join(absWsDir, DefaultStateFileName)
 	}
 
-	// Ensure clean call chain state on startup (D59)
+	// Ensure clean call chain state on startup (D59). This is a process-global mutation,
+	// which would be a real hazard in a process shared with other goroutines that read these
+	// vars concurrently - it is safe here only because this runs once at bot construction,
+	// before any A2A call-chain machinery starts, and the bot is the only thing in this
+	// process. os.Unsetenv only errors on a malformed key, which these fixed constant names
+	// can never be, so the error is discarded rather than checked.
 	_ = os.Unsetenv(agent.Agent2AgentEnvVar)
 	_ = os.Unsetenv(agent.CallChainEnvVar)
 

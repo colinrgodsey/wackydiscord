@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/bwmarrin/discordgo"
@@ -216,14 +217,12 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	// Verify agent exists
 	insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: agentID})
 	if err != nil || insp == nil || !insp.GetAgentDirExists() {
-		listResp, _ := b.SDK.ListAgents(context.Background(), &agentv1.ListAgentsRequest{})
-		var availAgents []string
-		if listResp != nil {
-			availAgents = listResp.GetAgentIds()
-		}
+		listResp, listErr := b.SDK.ListAgents(context.Background(), &agentv1.ListAgentsRequest{})
 		availStr := "none"
-		if len(availAgents) > 0 {
-			availStr = strings.Join(availAgents, ", ")
+		if listErr != nil {
+			availStr = fmt.Sprintf("could not read the workspace, listing failed: %v", listErr)
+		} else if listResp != nil && len(listResp.GetAgentIds()) > 0 {
+			availStr = strings.Join(listResp.GetAgentIds(), ", ")
 		}
 		b.respondInteraction(s, i, fmt.Sprintf("❌ Agent %q was not found in workspace %s.\nAvailable agents: %s", agentID, b.WsDir, availStr), true)
 		return
@@ -248,13 +247,18 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		whToken = wh.Token
 	}
 
-	// Read existing turns to initialize sync state
-	readResp, _ := b.SDK.ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: agentID})
+	// Read existing turns to initialize sync state. A failed read must refuse the bind
+	// rather than seed an empty baseline: lastIdx -1 looks identical to "nothing has been
+	// synced yet", and the next sync pass would then replay the agent's entire history into
+	// the channel as unsynced turns.
+	readResp, err := b.SDK.ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: agentID})
+	if err != nil {
+		b.respondInteraction(s, i, fmt.Sprintf("❌ Failed to read session history for agent %q, refusing to bind with an unknown baseline: %v", agentID, err), true)
+		return
+	}
 	var turns []*genai.Content
-	if readResp != nil {
-		for _, t := range readResp.GetTurns() {
-			turns = append(turns, SessionTurnToContent(t))
-		}
+	for _, t := range readResp.GetTurns() {
+		turns = append(turns, SessionTurnToContent(t))
 	}
 	lastIdx := len(turns) - 1
 	lastHash := ""
@@ -281,7 +285,9 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 
 	if b.Watcher != nil {
-		_ = b.Watcher.WatchAgent(agentID)
+		if err := b.Watcher.WatchAgent(agentID); err != nil {
+			log.Printf("⚠️ failed to watch agent %q for live session updates: %v", agentID, err)
+		}
 	}
 
 	b.respondInteraction(s, i, fmt.Sprintf("✅ Channel bound to agent **%s** (model: `%s`)!\nMessages sent in this channel will drive this agent.", agentID, modelName), false)
@@ -332,9 +338,11 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, i *discordgo.Interaction
 		return
 	}
 
-	memResp, _ := b.SDK.ReadMemory(context.Background(), &agentv1.ReadMemoryRequest{AgentId: binding.AgentID})
+	memResp, memErr := b.SDK.ReadMemory(context.Background(), &agentv1.ReadMemoryRequest{AgentId: binding.AgentID})
 	mem := ""
-	if memResp != nil {
+	if memErr != nil {
+		mem = fmt.Sprintf("memory unavailable: %v", memErr)
+	} else if memResp != nil {
 		mem = memResp.GetMemoryMd()
 	}
 	memSnippet := strings.TrimSpace(mem)
@@ -387,11 +395,16 @@ func (b *Bot) handleFillCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
-	// Defer response to allow backfill processing
+	// Defer response to allow backfill processing. If the ack itself fails there is nothing
+	// to edit later - Discord never learns we're working on it - so skip straight to
+	// aborting instead of doing the backfill work and then also failing to report it.
 	if s != nil && i != nil && i.Interaction != nil {
-		_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
-		})
+		}); err != nil {
+			log.Printf("⚠️ failed to defer interaction response in channel %s: %v", i.ChannelID, err)
+			return
+		}
 	}
 
 	syncUnlock := b.State.LockChannelSync(i.ChannelID)
@@ -541,22 +554,26 @@ func (b *Bot) respondInteraction(s *discordgo.Session, i *discordgo.InteractionC
 		flags = discordgo.MessageFlagsEphemeral
 	}
 
-	_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
 			Content: message,
 			Flags:   flags,
 		},
-	})
+	}); err != nil {
+		log.Printf("⚠️ failed to respond to interaction in channel %s: %v", i.ChannelID, err)
+	}
 }
 
 func (b *Bot) editInteractionResponse(s *discordgo.Session, i *discordgo.InteractionCreate, message string) {
 	if s == nil || i == nil || i.Interaction == nil {
 		return
 	}
-	_, _ = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+	if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 		Content: &message,
-	})
+	}); err != nil {
+		log.Printf("⚠️ failed to edit interaction response in channel %s: %v", i.ChannelID, err)
+	}
 }
 
 // handleCompactCommand archives the bound agent's oldest turns into MEMORY.md. The D44
@@ -586,11 +603,16 @@ func (b *Bot) handleCompactCommand(s *discordgo.Session, i *discordgo.Interactio
 		}
 	}
 
-	// Summarizing turns is a model call, so it does not fit inside Discord's interaction window.
+	// Summarizing turns is a model call, so it does not fit inside Discord's interaction
+	// window. If the ack itself fails there is nothing to edit later, so abort here instead
+	// of running compaction and then also failing to report the result.
 	if s != nil && i != nil && i.Interaction != nil {
-		_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
-		})
+		}); err != nil {
+			log.Printf("⚠️ failed to defer interaction response in channel %s: %v", i.ChannelID, err)
+			return
+		}
 	}
 
 	// Resolved rather than called on the SDK directly, so a channel bound to a routed agent
