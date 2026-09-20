@@ -12,6 +12,10 @@ import (
 )
 
 // SlashCommands defines the Discord application commands registered by wackydiscord.
+// errGeneratingBusy is the common rejection shown when a command that would race a
+// live generation turn arrives while the agent is already generating.
+const errGeneratingBusy = "⚠️ Agent is currently generating; please wait for generation to complete before running `%s`."
+
 var SlashCommands = []*discordgo.ApplicationCommand{
 	{
 		Name:        "bind",
@@ -400,7 +404,7 @@ func (b *Bot) handleFillCommand(s *discordgo.Session, i *discordgo.InteractionCr
 
 	if binding.IsGenerating {
 		syncUnlock()
-		b.editInteractionResponse(s, i, "⚠️ Agent is currently generating; please wait for generation to complete before running `/fill`.")
+		b.editInteractionResponse(s, i, fmt.Sprintf(errGeneratingBusy, "/fill"))
 		return
 	}
 	syncUnlock()
@@ -570,7 +574,7 @@ func (b *Bot) handleCompactCommand(s *discordgo.Session, i *discordgo.Interactio
 	// would serialize it anyway, but a long generation would leave the caller staring at a
 	// deferred Discord message, so this rejects cleanly instead of waiting.
 	if binding.IsGenerating {
-		b.respondInteraction(s, i, "⚠️ Agent is currently generating; wait for the turn to finish before running `/compact`.", true)
+		b.respondInteraction(s, i, fmt.Sprintf(errGeneratingBusy, "/compact"), true)
 		return
 	}
 
