@@ -2,14 +2,18 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/colinrgodsey/wackypub/pkg/agent"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 	"google.golang.org/genai"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // SlashCommands defines the Discord application commands registered by wackydiscord.
@@ -79,6 +83,18 @@ var SlashCommands = []*discordgo.ApplicationCommand{
 				Name:        "force",
 				Description: "Archive turns even when the session is still under the compaction threshold",
 				Required:    false,
+			},
+		},
+	},
+	{
+		Name:        "aside",
+		Description: "Ask the bound agent a one-shot question against its context, with no turn and nothing persisted",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Type:        discordgo.ApplicationCommandOptionString,
+				Name:        "question",
+				Description: "What to ask the agent",
+				Required:    true,
 			},
 		},
 	},
@@ -155,6 +171,8 @@ func (b *Bot) HandleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 		b.handleStopCommand(s, i)
 	case "compact":
 		b.handleCompactCommand(s, i)
+	case "aside":
+		b.handleAsideCommand(s, i)
 	}
 }
 
@@ -574,6 +592,145 @@ func (b *Bot) editInteractionResponse(s *discordgo.Session, i *discordgo.Interac
 	}); err != nil {
 		log.Printf("⚠️ failed to edit interaction response in channel %s: %v", i.ChannelID, err)
 	}
+}
+
+// asideQuestionTimeout bounds one aside RPC. A full contextual turn on a slow runtime can
+// legitimately take minutes, so this is a fuse against a wedged bridge rather than a normal
+// operating limit; past it the caller is told the aside was abandoned.
+const asideQuestionTimeout = 5 * time.Minute
+
+// handleAsideCommand asks the bound agent a one-shot question against its accumulated session
+// context. Unlike every other command here it deliberately does not reject a running
+// generation and takes no session lock: the aside forks the context in memory, denies tool
+// invocation, and persists nothing, so asking while the agent is mid-turn is the feature and
+// not a race (D112 aside contract).
+func (b *Bot) handleAsideCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	binding := b.State.GetBinding(i.ChannelID)
+	if binding == nil {
+		b.respondInteraction(s, i, "❌ This channel is not bound to any agent. Use `/bind <agent_id>` first.", true)
+		return
+	}
+
+	question := ""
+	for _, opt := range i.ApplicationCommandData().Options {
+		// The payload is Discord-supplied, so only read the option as a string when it is one.
+		if opt.Name == "question" && opt.Type == discordgo.ApplicationCommandOptionString {
+			if v, ok := opt.Value.(string); ok {
+				question = strings.TrimSpace(v)
+			}
+		}
+	}
+	if question == "" {
+		b.respondInteraction(s, i, "❌ `/aside` needs a question, e.g. `/aside what are you blocked on?`", true)
+		return
+	}
+
+	// The answer is a model turn, so it does not fit inside Discord's interaction window. If
+	// the ack itself fails there is nothing to edit later, so abort instead of running an
+	// aside whose answer has nowhere to go.
+	if s != nil && i != nil && i.Interaction != nil {
+		if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		}); err != nil {
+			log.Printf("⚠️ failed to defer interaction response in channel %s: %v", i.ChannelID, err)
+			return
+		}
+	}
+
+	// Asides against one agent queue behind each other. The protocol does not serialize them -
+	// every call forks its own in-memory session - so without this two people asking at once
+	// both pay for a full context turn simultaneously. Nothing else takes this mutex, so a
+	// generation is never blocked by a queued aside.
+	unlock := b.State.LockAgentAside(binding.AgentID)
+	defer unlock()
+
+	// Resolved rather than called on the SDK directly, so a bridged agent gets the bridge's own
+	// answer - including its refusal - instead of a local agent nobody is talking to.
+	client, cleanup, err := agent.ResolveAgentClient(context.Background(), b.SDK, binding.AgentID)
+	if err != nil {
+		b.editInteractionResponse(s, i, fmt.Sprintf("❌ Could not reach agent **%s**: %v", binding.AgentID, err))
+		return
+	}
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), asideQuestionTimeout)
+	defer cancel()
+
+	resp, err := client.AsideQuestion(ctx, &agentv1.AsideQuestionRequest{
+		AgentId:  binding.AgentID,
+		Question: question,
+	})
+	if err != nil {
+		if msg, ok := asideUnsupportedMessage(binding.AgentID, err); ok {
+			b.editInteractionResponse(s, i, msg)
+			return
+		}
+		b.editInteractionResponse(s, i, fmt.Sprintf("❌ Aside failed for **%s**: %v", binding.AgentID, err))
+		return
+	}
+
+	chunks := SplitDiscordMessage(asideReply(binding.AgentID, resp))
+	if len(chunks) == 0 {
+		b.editInteractionResponse(s, i, fmt.Sprintf("ℹ️ **%s** returned an empty aside answer.", binding.AgentID))
+		return
+	}
+	b.editInteractionResponse(s, i, chunks[0])
+	// An answer longer than one Discord message continues as ordinary channel messages: the
+	// interaction channel is capped, the answer is not.
+	for _, chunk := range chunks[1:] {
+		// The answer already exists, so a failed continuation is reported rather than retried:
+		// re-running the aside would cost a second full context turn for a Discord hiccup.
+		if err := SendAgentMessage(s, i.ChannelID, binding.AgentID, chunk, nil); err != nil {
+			log.Printf("⚠️ failed to deliver the rest of the aside in channel %s: %v", i.ChannelID, err)
+		}
+	}
+}
+
+// asideUnsupportedMessage recognises a bridge that refuses the aside with codes.Unimplemented -
+// an ACP-bridged harness session cannot fork the agent's accumulated context - and turns it
+// into the reply the caller should see, keeping the bridge's own explanation instead of
+// flattening a designed refusal into "aside failed". errors.As walks wrapped errors, so a
+// dispatch layer that wrapped the status error is still recognised.
+func asideUnsupportedMessage(agentID string, err error) (string, bool) {
+	var statusErr interface {
+		GRPCStatus() *status.Status
+	}
+	if !errors.As(err, &statusErr) {
+		return "", false
+	}
+	st := statusErr.GRPCStatus()
+	if st == nil || st.Code() != codes.Unimplemented {
+		return "", false
+	}
+	if msg := strings.TrimSpace(st.Message()); msg != "" {
+		return fmt.Sprintf("ℹ️ Aside is not supported for bridged agent **%s**: %s", agentID, msg), true
+	}
+	return fmt.Sprintf("ℹ️ Aside is not supported for bridged agent **%s**.", agentID), true
+}
+
+// asideReply formats the answer so it reads as what it is: an answer forked from the agent's
+// context that nothing afterwards remembers. The footer is where a denied tool attempt or a
+// fallback warning surfaces, because without it "I ran the tests and they pass" from an agent
+// that was never allowed to run anything is indistinguishable from the real thing.
+func asideReply(agentID string, resp *agentv1.AsideQuestionResponse) string {
+	text := strings.TrimSpace(resp.GetText())
+	if text == "" {
+		return fmt.Sprintf("ℹ️ **%s** returned an empty aside answer.", agentID)
+	}
+
+	var notes []string
+	if denials := resp.GetToolDenials(); denials > 0 {
+		notes = append(notes, fmt.Sprintf("%d tool attempt(s) denied", denials))
+	}
+	notes = append(notes, resp.GetWarnings()...)
+	if usage := resp.GetUsage(); usage != nil && usage.GetTotalTokens() > 0 {
+		notes = append(notes, fmt.Sprintf("%d tokens", usage.GetTotalTokens()))
+	}
+
+	if len(notes) == 0 {
+		return fmt.Sprintf("💬 **Aside · %s**\n%s", agentID, text)
+	}
+	return fmt.Sprintf("💬 **Aside · %s**\n%s\n\n— _%s_", agentID, text, strings.Join(notes, " · "))
 }
 
 // handleCompactCommand archives the bound agent's oldest turns into MEMORY.md. The D44
