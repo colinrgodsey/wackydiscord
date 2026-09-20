@@ -72,6 +72,7 @@ type State struct {
 	chanSyncMu    map[string]*sync.Mutex
 	chanTurnMu    map[string]*sync.Mutex
 	chanDrainMu   map[string]*sync.Mutex
+	agentAsideMu  map[string]*sync.Mutex
 	filePath      string
 	claimedUserID string
 	defaultOpen   bool
@@ -98,12 +99,13 @@ func NewState(filePath string) (*State, error) {
 	}
 
 	s := &State{
-		filePath:    filePath,
-		defaultOpen: defaultOpen,
-		Bindings:    make(map[string]*ChannelBinding),
-		chanSyncMu:  make(map[string]*sync.Mutex),
-		chanTurnMu:  make(map[string]*sync.Mutex),
-		chanDrainMu: make(map[string]*sync.Mutex),
+		filePath:     filePath,
+		defaultOpen:  defaultOpen,
+		Bindings:     make(map[string]*ChannelBinding),
+		chanSyncMu:   make(map[string]*sync.Mutex),
+		chanTurnMu:   make(map[string]*sync.Mutex),
+		chanDrainMu:  make(map[string]*sync.Mutex),
+		agentAsideMu: make(map[string]*sync.Mutex),
 	}
 
 	if data, err := os.ReadFile(filePath); err == nil {
@@ -193,6 +195,32 @@ func (s *State) LockChannelDrain(channelID string) func() {
 // It forwards to LockChannelSync for backwards compatibility.
 func (s *State) LockChannel(channelID string) func() {
 	return s.LockChannelSync(channelID)
+}
+
+// LockAgentAside acquires the aside mutex for the specified agentID. It serializes concurrent
+// asides against one agent: the protocol runs each aside independently (its own in-memory fork,
+// no session lock), so without this every concurrent question pays for a full context turn at
+// the same moment. Keyed by agent rather than channel because two channels bound to the same
+// agent share the one context being forked. Nothing else takes it, so a generation turn can
+// never be blocked by a queued question.
+func (s *State) LockAgentAside(agentID string) func() {
+	s.chanLocksMu.Lock()
+	if s.agentAsideMu == nil {
+		s.agentAsideMu = make(map[string]*sync.Mutex)
+	}
+	mu, ok := s.agentAsideMu[agentID]
+	if !ok {
+		mu = &sync.Mutex{}
+		s.agentAsideMu[agentID] = mu
+	}
+	s.chanLocksMu.Unlock()
+
+	// The map lock is released before locking mu, because mu can be held for the whole
+	// duration of a model turn.
+	mu.Lock()
+	return func() {
+		mu.Unlock()
+	}
 }
 
 // GetBinding retrieves the binding for a channel, returning nil if unbound.

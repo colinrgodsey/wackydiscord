@@ -10,6 +10,7 @@ require (
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/spf13/cobra v1.10.2
 	google.golang.org/genai v1.57.0
+	google.golang.org/grpc v1.81.0
 )
 
 require (
@@ -78,7 +79,6 @@ require (
 	google.golang.org/adk/v2 v2.0.0 // indirect
 	google.golang.org/api v0.279.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260511170946-3700d4141b60 // indirect
-	google.golang.org/grpc v1.81.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
