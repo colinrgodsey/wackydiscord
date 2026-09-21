@@ -99,6 +99,18 @@ var SlashCommands = []*discordgo.ApplicationCommand{
 		},
 	},
 	{
+		Name:        "add",
+		Description: "Queue a message into the bound agent's session without triggering a turn",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Type:        discordgo.ApplicationCommandOptionString,
+				Name:        "message",
+				Description: "Text to append to the agent's session",
+				Required:    true,
+			},
+		},
+	},
+	{
 		Name:        "claim",
 		Description: "Claim ownership of this bot instance",
 	},
@@ -173,6 +185,8 @@ func (b *Bot) HandleInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 		b.handleCompactCommand(s, i)
 	case "aside":
 		b.handleAsideCommand(s, i)
+	case "add":
+		b.handleAddCommand(s, i)
 	}
 }
 
@@ -661,7 +675,7 @@ func (b *Bot) handleAsideCommand(s *discordgo.Session, i *discordgo.InteractionC
 		Question: question,
 	})
 	if err != nil {
-		if msg, ok := asideUnsupportedMessage(binding.AgentID, err); ok {
+		if msg, ok := bridgeUnsupportedMessage(binding.AgentID, "Aside", err); ok {
 			b.editInteractionResponse(s, i, msg)
 			return
 		}
@@ -686,12 +700,13 @@ func (b *Bot) handleAsideCommand(s *discordgo.Session, i *discordgo.InteractionC
 	}
 }
 
-// asideUnsupportedMessage recognises a bridge that refuses the aside with codes.Unimplemented -
-// an ACP-bridged harness session cannot fork the agent's accumulated context - and turns it
-// into the reply the caller should see, keeping the bridge's own explanation instead of
-// flattening a designed refusal into "aside failed". errors.As walks wrapped errors, so a
-// dispatch layer that wrapped the status error is still recognised.
-func asideUnsupportedMessage(agentID string, err error) (string, bool) {
+// bridgeUnsupportedMessage recognises a bridge that refuses an RPC with codes.Unimplemented -
+// an ACP-bridged harness session cannot fork the agent's accumulated context, and cannot take
+// input without prompting it - and turns the refusal into the reply the caller should see,
+// keeping the bridge's own explanation instead of flattening a designed answer into "the
+// command failed". errors.As walks wrapped errors, so a dispatch layer that wrapped the status
+// error is still recognised.
+func bridgeUnsupportedMessage(agentID string, what string, err error) (string, bool) {
 	var statusErr interface {
 		GRPCStatus() *status.Status
 	}
@@ -703,9 +718,9 @@ func asideUnsupportedMessage(agentID string, err error) (string, bool) {
 		return "", false
 	}
 	if msg := strings.TrimSpace(st.Message()); msg != "" {
-		return fmt.Sprintf("ℹ️ Aside is not supported for bridged agent **%s**: %s", agentID, msg), true
+		return fmt.Sprintf("ℹ️ %s is not supported for bridged agent **%s**: %s", what, agentID, msg), true
 	}
-	return fmt.Sprintf("ℹ️ Aside is not supported for bridged agent **%s**.", agentID), true
+	return fmt.Sprintf("ℹ️ %s is not supported for bridged agent **%s**.", what, agentID), true
 }
 
 // asideReply formats the answer so it reads as what it is: an answer forked from the agent's
@@ -731,6 +746,92 @@ func asideReply(agentID string, resp *agentv1.AsideQuestionResponse) string {
 		return fmt.Sprintf("💬 **Aside · %s**\n%s", agentID, text)
 	}
 	return fmt.Sprintf("💬 **Aside · %s**\n%s\n\n— _%s_", agentID, text, strings.Join(notes, " · "))
+}
+
+// handleAddCommand appends the caller's message to the bound agent's session via AddUserTurn
+// and generates nothing - the Discord analog of `wackypub agent add`. The turn waits in
+// session.jsonl for the agent's next natural turn, where CleanSessionTurns merges consecutive
+// user turns, so repeated /add calls coalesce into one user turn instead of violating the
+// alternating-role rule that model APIs enforce.
+//
+// Two differences from /compact and /aside are deliberate:
+//
+//   - It answers directly instead of deferring, because an append is a locked file write and
+//     not a model call, so it lands well inside Discord's interaction window. The exception is
+//     worth knowing: AcquireSessionLock takes a blocking flock that no context deadline can
+//     interrupt, so if a foreign process (a CLI turn, another bot) holds the session lock, the
+//     append waits for it and the ack can arrive after the window. The turn is still queued,
+//     and the verbose backfill shows it, so the rare case does not get a second dialog.
+//   - It rejects while the bot is generating, unlike /aside. AddUserTurn writes into the same
+//     transcript the runner is appending to, so a mid-generation add is precisely the
+//     interleaving the session lock exists to prevent.
+func (b *Bot) handleAddCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	binding := b.State.GetBinding(i.ChannelID)
+	if binding == nil {
+		b.respondInteraction(s, i, "❌ This channel is not bound to any agent. Use `/bind <agent_id>` first.", true)
+		return
+	}
+
+	if binding.IsGenerating {
+		b.respondInteraction(s, i, fmt.Sprintf(errGeneratingBusy, "/add"), true)
+		return
+	}
+
+	message := ""
+	for _, opt := range i.ApplicationCommandData().Options {
+		// StringValue panics on an option of another type, and the payload is Discord-supplied.
+		if opt.Name == "message" && opt.Type == discordgo.ApplicationCommandOptionString {
+			if v, ok := opt.Value.(string); ok {
+				message = strings.TrimSpace(v)
+			}
+		}
+	}
+	if message == "" {
+		b.respondInteraction(s, i, "❌ `/add` needs a message, e.g. `/add the staging key rotated this morning`", true)
+		return
+	}
+
+	// Resolved rather than called on the SDK directly, so a channel bound to a routed agent sends
+	// the append to the bridge that owns the session instead of writing into a local folder that
+	// nothing will ever read.
+	client, cleanup, err := agent.ResolveAgentClient(context.Background(), b.SDK, binding.AgentID)
+	if err != nil {
+		b.respondInteraction(s, i, queueFailure(binding.AgentID, err), false)
+		return
+	}
+	defer cleanup()
+
+	res, err := client.AddUserTurn(context.Background(), &agentv1.AddUserTurnRequest{
+		AgentId: binding.AgentID,
+		Message: message,
+	})
+	if err != nil {
+		b.respondInteraction(s, i, queueFailure(binding.AgentID, err), false)
+		return
+	}
+
+	b.respondInteraction(s, i, addAck(binding.AgentID, res), false)
+}
+
+// queueFailure words an append failure. A bridge that has not implemented the RPC is answering
+// a question - can this harness take input without prompting - rather than failing, so its
+// refusal and reason are what the operator needs.
+func queueFailure(agentID string, err error) string {
+	if msg, ok := bridgeUnsupportedMessage(agentID, "Queuing input", err); ok {
+		return msg
+	}
+	return fmt.Sprintf("❌ Could not queue for **%s**: %v", agentID, err)
+}
+
+// addAck confirms storage in the bot's own voice and no one else's. Nothing answered the
+// message, so the confirmation must not read like a reply; hook warnings are appended because
+// RunUserMessageHooks may have rewritten the text on the way into the session.
+func addAck(agentID string, res *agentv1.AddUserTurnResponse) string {
+	ack := fmt.Sprintf("✅ Queued for **%s**. Nothing was generated - the agent picks it up on its next turn.", agentID)
+	for _, warning := range res.GetWarnings() {
+		ack += "\n\u26a0\ufe0f " + warning
+	}
+	return ack
 }
 
 // handleCompactCommand archives the bound agent's oldest turns into MEMORY.md. The D44

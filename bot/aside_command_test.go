@@ -201,7 +201,7 @@ func TestAsideCommand_BridgedUnimplementedSurfacesBridgeMessage(t *testing.T) {
 	}
 	for name, err := range cases {
 		t.Run(name, func(t *testing.T) {
-			msg, ok := asideUnsupportedMessage("bob", err)
+			msg, ok := bridgeUnsupportedMessage("bob", "Aside", err)
 			if !ok {
 				t.Fatalf("Unimplemented not recognised: %v", err)
 			}
@@ -216,7 +216,7 @@ func TestAsideCommand_BridgedUnimplementedSurfacesBridgeMessage(t *testing.T) {
 		"plain error": errors.New("connection reset by peer"),
 		"nil":         nil,
 	} {
-		if msg, ok := asideUnsupportedMessage("bob", err); ok {
+		if msg, ok := bridgeUnsupportedMessage("bob", "Aside", err); ok {
 			t.Errorf("%s misread as an unsupported-bridge refusal: %q", name, msg)
 		}
 	}
