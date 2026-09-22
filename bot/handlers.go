@@ -33,20 +33,8 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 	turnUnlock := b.State.LockChannelTurn(m.ChannelID)
 	defer turnUnlock()
 
-	// Post-lock fresh read: guarantees up-to-date binding snapshot under lock and guards unbinding race
-	binding := b.State.GetBinding(m.ChannelID)
-	if binding == nil {
-		return
-	}
-
-	// Verify bound agent exists and has valid configuration
-	insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID})
-	if err != nil || insp == nil || !insp.GetAgentDirExists() {
-		b.say(s, m.ChannelID, "System", fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`. Use `/bind <agent_id>` to connect a valid agent.", binding.AgentID, b.WsDir), nil)
-		return
-	}
-	if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
-		b.say(s, m.ChannelID, "System", fmt.Sprintf("⚠️ **Agent Configuration Error:** Agent %q has an invalid `runtime.json`: %s", binding.AgentID, insp.GetRuntimeJsonError()), nil)
+	binding, ok := b.resolveMessageContext(s, m.ChannelID)
+	if !ok {
 		return
 	}
 
@@ -56,16 +44,51 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 	}
 
 	// 2. Prepare user message text & attachments
+	userText := b.prepareUserText(s, m, binding.AgentID)
+	if userText == "" {
+		return
+	}
+
+	b.runTurn(s, m, binding, userText)
+}
+
+// resolveMessageContext re-reads the channel binding under the already-held turn lock
+// (guarding the unbinding race) and validates that the bound agent still exists with a
+// valid runtime configuration. It sends the appropriate error notice itself when
+// validation fails, so callers only need to check the returned bool before continuing.
+func (b *Bot) resolveMessageContext(s *discordgo.Session, channelID string) (*ChannelBinding, bool) {
+	// Post-lock fresh read: guarantees up-to-date binding snapshot under lock and guards unbinding race
+	binding := b.State.GetBinding(channelID)
+	if binding == nil {
+		return nil, false
+	}
+
+	// Verify bound agent exists and has valid configuration
+	insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID})
+	if err != nil || insp == nil || !insp.GetAgentDirExists() {
+		b.say(s, channelID, "System", fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`. Use `/bind <agent_id>` to connect a valid agent.", binding.AgentID, b.WsDir), nil)
+		return nil, false
+	}
+	if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
+		b.say(s, channelID, "System", fmt.Sprintf("⚠️ **Agent Configuration Error:** Agent %q has an invalid `runtime.json`: %s", binding.AgentID, insp.GetRuntimeJsonError()), nil)
+		return nil, false
+	}
+	return binding, true
+}
+
+// prepareUserText trims the message text and folds in any attachment-derived prompt text
+// and notices, returning "" when there is nothing left to send to the agent.
+func (b *Bot) prepareUserText(s *discordgo.Session, m *discordgo.MessageCreate, agentID string) string {
 	userText := strings.TrimSpace(m.Content)
 	if userText == "" && len(m.Attachments) == 0 {
-		return
+		return ""
 	}
 
 	if len(m.Attachments) > 0 {
 		attCtx, cancel := context.WithTimeout(context.Background(), TotalAttachmentBudget)
 		defer cancel()
 
-		attResult, _ := b.ProcessAttachments(attCtx, binding.AgentID, m.Attachments)
+		attResult, _ := b.ProcessAttachments(attCtx, agentID, m.Attachments)
 		if attResult != nil {
 			for _, notice := range attResult.Notices {
 				b.say(s, m.ChannelID, "System", notice, nil)
@@ -82,10 +105,14 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		}
 	}
 
-	if userText == "" {
-		return
-	}
+	return userText
+}
 
+// runTurn dispatches userText as a new agent turn, streams the response back to the
+// channel (via withTyping to keep the typing indicator alive), and posts a stop/error
+// notice when the turn didn't complete cleanly. It owns the IsGenerating bookkeeping
+// across dispatch and streaming.
+func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding *ChannelBinding, userText string) {
 	// 3. Mark channel as actively generating under LockChannelSync
 	expectedHash := ComputeTurnHash(genai.NewContentFromText(userText, "user"))
 	var shouldProceed bool
@@ -167,57 +194,40 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		log.Printf("⚠️ hook warning for agent %s: %s", binding.AgentID, w)
 	}
 
-	stopTyping := make(chan struct{})
-	if s != nil {
-		go func() {
-			// Send initial typing indicator
-			_ = s.ChannelTyping(m.ChannelID)
-			ticker := time.NewTicker(6 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					_ = s.ChannelTyping(m.ChannelID)
-				case <-stopTyping:
-					return
-				}
+	streamErr := b.withTyping(s, m.ChannelID, func() error {
+		// 4. Ensure Webhook is available for persona delivery
+		if binding.WebhookID == "" || binding.WebhookToken == "" {
+			if newWH, err := EnsureWebhook(s, m.ChannelID); err == nil && newWH != nil {
+				func() {
+					syncUnlock := b.State.LockChannelSync(m.ChannelID)
+					defer syncUnlock()
+					if bnd := b.State.GetBinding(m.ChannelID); bnd != nil && bnd.AgentID == binding.AgentID {
+						bnd.WebhookID = newWH.ID
+						bnd.WebhookToken = newWH.Token
+						// Best-effort cache of the resolved webhook: in-memory state is what
+						// gates behavior, and NewState resets IsGenerating on load (state.go),
+						// so losing only this persist just costs one extra EnsureWebhook call
+						// next turn - unlike a SetBinding failure elsewhere, this one is tolerable.
+						_ = b.State.SetBinding(bnd)
+					}
+				}()
 			}
-		}()
-	}
-
-	// 4. Ensure Webhook is available for persona delivery
-	if binding.WebhookID == "" || binding.WebhookToken == "" {
-		if newWH, err := EnsureWebhook(s, m.ChannelID); err == nil && newWH != nil {
-			func() {
-				syncUnlock := b.State.LockChannelSync(m.ChannelID)
-				defer syncUnlock()
-				if bnd := b.State.GetBinding(m.ChannelID); bnd != nil && bnd.AgentID == binding.AgentID {
-					bnd.WebhookID = newWH.ID
-					bnd.WebhookToken = newWH.Token
-					// Best-effort cache of the resolved webhook: in-memory state is what
-					// gates behavior, and NewState resets IsGenerating on load (state.go),
-					// so losing only this persist just costs one extra EnsureWebhook call
-					// next turn - unlike a SetBinding failure elsewhere, this one is tolerable.
-					_ = b.State.SetBinding(bnd)
-				}
-			}()
 		}
-	}
 
-	ctx := context.Background()
+		ctx := context.Background()
 
-	stream := agent.NewInProcessStream[agentv1.GenerateTurnStreamResponse](ctx, 16)
-	errCh := make(chan error, 1)
-	go func() {
-		defer stream.Close()
-		errCh <- b.SDK.GenerateTurnStream(&agentv1.GenerateTurnStreamRequest{AgentId: binding.AgentID}, stream)
-	}()
+		stream := agent.NewInProcessStream[agentv1.GenerateTurnStreamResponse](ctx, 16)
+		errCh := make(chan error, 1)
+		go func() {
+			defer stream.Close()
+			errCh <- b.SDK.GenerateTurnStream(&agentv1.GenerateTurnStreamRequest{AgentId: binding.AgentID}, stream)
+		}()
 
-	for range stream.Chunks() {
-		// SessionWatcher is now the primary live renderer. Do not post duplicate live chunks from handler loop.
-	}
-	streamErr := <-errCh
-	close(stopTyping)
+		for range stream.Chunks() {
+			// SessionWatcher is now the primary live renderer. Do not post duplicate live chunks from handler loop.
+		}
+		return <-errCh
+	})
 
 	func() {
 		syncUnlock := b.State.LockChannelSync(m.ChannelID)
@@ -243,6 +253,31 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		b.say(s, m.ChannelID, "System", fmt.Sprintf("❌ **Agent error:** %v", streamErr), nil)
 		return
 	}
+}
+
+// withTyping runs fn while a background goroutine keeps the Discord typing indicator
+// alive on channelID, stopping the indicator once fn returns.
+func (b *Bot) withTyping(s *discordgo.Session, channelID string, fn func() error) error {
+	stopTyping := make(chan struct{})
+	if s != nil {
+		go func() {
+			// Send initial typing indicator
+			_ = s.ChannelTyping(channelID)
+			ticker := time.NewTicker(6 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					_ = s.ChannelTyping(channelID)
+				case <-stopTyping:
+					return
+				}
+			}
+		}()
+	}
+	err := fn()
+	close(stopTyping)
+	return err
 }
 
 // autoFillUnsyncedTurns replays background session turns not yet seen in Discord.
