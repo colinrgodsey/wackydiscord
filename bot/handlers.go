@@ -223,8 +223,20 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 			errCh <- b.SDK.GenerateTurnStream(&agentv1.GenerateTurnStreamRequest{AgentId: binding.AgentID}, stream)
 		}()
 
-		for range stream.Chunks() {
-			// SessionWatcher is now the primary live renderer. Do not post duplicate live chunks from handler loop.
+		// D112 tool-call visibility: live tool activity is rendered straight off the
+		// stream. Message text stays with the SessionWatcher, so the two renderers never
+		// write the same content. Gated on /verbose like the backfilled tool detail.
+		liveBnd := b.State.GetBinding(m.ChannelID)
+		if liveBnd == nil {
+			liveBnd = binding
+		}
+		var toolActivity *ToolActivity
+		if liveBnd.Verbose {
+			toolActivity = NewToolActivity(newChannelPoster(s, m.ChannelID, liveBnd))
+			defer toolActivity.Finish()
+		}
+		for resp := range stream.Chunks() {
+			toolActivity.Observe(resp)
 		}
 		return <-errCh
 	})
