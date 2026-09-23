@@ -415,28 +415,13 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		wh = &discordgo.Webhook{ID: whID, Token: whToken}
 	}
 
-	var toolSummaries []string
-	flushToolBatch := func() {
-		if len(toolSummaries) == 0 {
-			return
-		}
-		combined := strings.Join(toolSummaries, "\n\n")
-		toolSummaries = nil
-		chunks := SplitDiscordMessage(combined, MaxDiscordMessageLength)
-		for _, chunk := range chunks {
-			b.say(s, channelID, "Tools", chunk, nil)
-		}
-	}
-
 	for _, item := range toProcess {
 		turn := item.turn
 		if item.isEcho {
-			flushToolBatch()
 			continue
 		}
 
 		if IsSyntheticHarnessTurn(turn) {
-			flushToolBatch()
 			if verbose {
 				badge := FormatSyntheticHarnessTurn(turn)
 				if badge != "" {
@@ -446,27 +431,19 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 			continue
 		}
 
-		toolText := FormatToolTurnSummary(turn)
-		if toolText != "" && verbose {
-			toolSummaries = append(toolSummaries, toolText)
-		}
-
 		if turn.Role == "user" {
 			text := FormatUserBackfillMessage(turn)
 			if text != "" {
-				flushToolBatch()
 				b.say(s, channelID, "User", text, nil)
 			}
 		} else {
 			text := FormatAssistantBackfillMessage(turn)
 			if text != "" {
-				flushToolBatch()
 				text = ExpandScratchpadSentinels(b.SDK, agentID, text)
 				b.say(s, channelID, agentID, text, wh)
 			}
 		}
 	}
-	flushToolBatch()
 
 	return len(unsynced), nil
 }

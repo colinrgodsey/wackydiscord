@@ -199,65 +199,6 @@ func FormatAssistantBackfillMessage(turn *genai.Content) string {
 	return strings.TrimSpace(sb.String())
 }
 
-// FormatToolTurnSummary formats tool call and response parts for verbose mode.
-func FormatToolTurnSummary(turn *genai.Content) string {
-	if turn == nil {
-		return ""
-	}
-
-	var sb strings.Builder
-	for _, p := range turn.Parts {
-		if p == nil {
-			continue
-		}
-		if p.FunctionCall != nil {
-			argsBytes, err := json.MarshalIndent(p.FunctionCall.Args, "", "  ")
-			if err != nil {
-				if argsBytes, err = json.Marshal(p.FunctionCall.Args); err != nil {
-					// Both marshal attempts failed identically (the value itself is
-					// unmarshalable), so fall back to a Go-syntax rendering rather than
-					// silently showing empty arguments, which reads as "called with none".
-					argsBytes = []byte(fmt.Sprintf("%v", p.FunctionCall.Args))
-				}
-			}
-			argsStr := string(argsBytes)
-			if len(argsStr) > 1200 {
-				argsStr = argsStr[:1200] + "\n... (truncated)"
-			}
-			sb.WriteString(fmt.Sprintf("🔧 **Tool Call:** `%s`\n```json\n%s\n```\n", p.FunctionCall.Name, argsStr))
-		}
-		if p.FunctionResponse != nil {
-			if p.FunctionResponse.Response != nil {
-				if outStr, ok := p.FunctionResponse.Response["output"].(string); ok && outStr != "" {
-					summary := strings.TrimSpace(outStr)
-					if len(summary) > 1200 {
-						summary = summary[:1200] + "\n... (truncated)"
-					}
-					sb.WriteString(fmt.Sprintf("⚡ **Tool Output:** `%s`\n```\n%s\n```\n", p.FunctionResponse.Name, summary))
-				} else {
-					respBytes, err := json.MarshalIndent(p.FunctionResponse.Response, "", "  ")
-					if err != nil {
-						if respBytes, err = json.Marshal(p.FunctionResponse.Response); err != nil {
-							// Same fallback as the tool-call args above: survive in some
-							// shape rather than silently rendering an empty response.
-							respBytes = []byte(fmt.Sprintf("%v", p.FunctionResponse.Response))
-						}
-					}
-					summary := string(respBytes)
-					if len(summary) > 1200 {
-						summary = summary[:1200] + "\n... (truncated)"
-					}
-					sb.WriteString(fmt.Sprintf("⚡ **Tool Response:** `%s`\n```json\n%s\n```\n", p.FunctionResponse.Name, summary))
-				}
-			} else {
-				sb.WriteString(fmt.Sprintf("⚡ **Tool Response:** `%s`\n", p.FunctionResponse.Name))
-			}
-		}
-	}
-
-	return strings.TrimSpace(sb.String())
-}
-
 var (
 	scratchpadExpandRegex = regexp.MustCompile(`(?i)<SCRATCHPAD_EXPAND\s+([^>]+)\s*/?>`)
 	expandIDRegex         = regexp.MustCompile(`(?i)id=\\?["']([^"'\\\s]+)["']\\?`)
