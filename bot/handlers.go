@@ -223,8 +223,20 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 			errCh <- b.SDK.GenerateTurnStream(&agentv1.GenerateTurnStreamRequest{AgentId: binding.AgentID}, stream)
 		}()
 
-		for range stream.Chunks() {
-			// SessionWatcher is now the primary live renderer. Do not post duplicate live chunks from handler loop.
+		// D112 tool-call visibility: live tool activity is rendered straight off the
+		// stream. Message text stays with the SessionWatcher, so the two renderers never
+		// write the same content. Gated on /verbose like the backfilled tool detail.
+		liveBnd := b.State.GetBinding(m.ChannelID)
+		if liveBnd == nil {
+			liveBnd = binding
+		}
+		var toolActivity *ToolActivity
+		if liveBnd.Verbose {
+			toolActivity = NewToolActivity(newChannelPoster(s, m.ChannelID, liveBnd))
+			defer toolActivity.Finish()
+		}
+		for resp := range stream.Chunks() {
+			toolActivity.Observe(resp)
 		}
 		return <-errCh
 	})
@@ -403,28 +415,13 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		wh = &discordgo.Webhook{ID: whID, Token: whToken}
 	}
 
-	var toolSummaries []string
-	flushToolBatch := func() {
-		if len(toolSummaries) == 0 {
-			return
-		}
-		combined := strings.Join(toolSummaries, "\n\n")
-		toolSummaries = nil
-		chunks := SplitDiscordMessage(combined, MaxDiscordMessageLength)
-		for _, chunk := range chunks {
-			b.say(s, channelID, "Tools", chunk, nil)
-		}
-	}
-
 	for _, item := range toProcess {
 		turn := item.turn
 		if item.isEcho {
-			flushToolBatch()
 			continue
 		}
 
 		if IsSyntheticHarnessTurn(turn) {
-			flushToolBatch()
 			if verbose {
 				badge := FormatSyntheticHarnessTurn(turn)
 				if badge != "" {
@@ -434,27 +431,19 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 			continue
 		}
 
-		toolText := FormatToolTurnSummary(turn)
-		if toolText != "" && verbose {
-			toolSummaries = append(toolSummaries, toolText)
-		}
-
 		if turn.Role == "user" {
 			text := FormatUserBackfillMessage(turn)
 			if text != "" {
-				flushToolBatch()
 				b.say(s, channelID, "User", text, nil)
 			}
 		} else {
 			text := FormatAssistantBackfillMessage(turn)
 			if text != "" {
-				flushToolBatch()
 				text = ExpandScratchpadSentinels(b.SDK, agentID, text)
 				b.say(s, channelID, agentID, text, wh)
 			}
 		}
 	}
-	flushToolBatch()
 
 	return len(unsynced), nil
 }

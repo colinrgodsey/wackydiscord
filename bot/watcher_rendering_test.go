@@ -97,7 +97,7 @@ func createMockDiscordSession(mu *sync.Mutex, sentMessages *[]string) *discordgo
 }
 
 // 1. Test that tool execution during generation renders via watcher without deadlocking.
-func TestWatcher_ToolExecutionDuringGenerationRendersWithoutDeadlock(t *testing.T) {
+func TestWatcher_ToolExecutionDuringGenerationNotBackfilledWithoutDeadlock(t *testing.T) {
 	b, agentDir, st := setupTestBot(t, "builder")
 
 	var mu sync.Mutex
@@ -173,19 +173,11 @@ func TestWatcher_ToolExecutionDuringGenerationRendersWithoutDeadlock(t *testing.
 	msgs := append([]string{}, sentMessages...)
 	mu.Unlock()
 
-	foundCall := false
-	foundOutput := false
+	// Tool detail belongs to the live stream renderer, not the watcher backfill.
 	for _, m := range msgs {
-		if strings.Contains(m, "Tool Call") && strings.Contains(m, "run_build") {
-			foundCall = true
+		if strings.Contains(m, "Tool Call") || strings.Contains(m, "Tool Output") {
+			t.Errorf("watcher backfilled tool detail, expected none: %q", m)
 		}
-		if strings.Contains(m, "Tool Output") && strings.Contains(m, "Build succeeded") {
-			foundOutput = true
-		}
-	}
-
-	if !foundCall || !foundOutput {
-		t.Errorf("expected batched tool call and output rendered, got messages: %v", msgs)
 	}
 
 	// Verify sync markers were committed
@@ -395,7 +387,7 @@ func TestWatcher_UnbindSynchronizesCleanlyWithTurnGeneration(t *testing.T) {
 }
 
 // 5. Test tool turn coalescing into batched summaries <= 2000 chars.
-func TestWatcher_ToolTurnCoalescingAndChunking(t *testing.T) {
+func TestWatcher_ToolTurnsSyncWithoutToolBackfill(t *testing.T) {
 	b, agentDir, st := setupTestBot(t, "batch_agent")
 
 	var mu sync.Mutex
@@ -462,9 +454,12 @@ func TestWatcher_ToolTurnCoalescingAndChunking(t *testing.T) {
 	msgs := append([]string{}, sentMessages...)
 	mu.Unlock()
 
-	// Contiguous tool turns should be coalesced into 1 message, followed by assistant text
-	if len(msgs) != 2 {
-		t.Errorf("expected 2 messages (1 batched tools + 1 text), got %d: %v", len(msgs), msgs)
+	// Tool turns produce no backfill messages; only the assistant text turn renders.
+	if len(msgs) != 1 {
+		t.Errorf("expected 1 message (assistant text only), got %d: %v", len(msgs), msgs)
+	}
+	if len(msgs) == 1 && !strings.Contains(msgs[0], "All tools finished.") {
+		t.Errorf("expected the assistant text turn to render, got %q", msgs[0])
 	}
 
 	// Enforce 2000-char limit on all messages
