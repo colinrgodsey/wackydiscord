@@ -223,8 +223,9 @@ func (b *Bot) ProcessAttachments(ctx context.Context, agentID string, attachment
 		if isImageAttachment(att) {
 			if len(data) > 0 {
 				if _, addErr := b.Client.AddMedia(budgetCtx, &agentv1.AddMediaRequest{
-					AgentId:   agentID,
-					MediaData: data,
+					AgentId:      agentID,
+					MediaData:    data,
+					WorkspaceDir: b.WsDir,
 				}); addErr == nil {
 					result.ImagesDownloaded++
 				} else {

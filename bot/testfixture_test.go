@@ -210,6 +210,12 @@ func (f *fakeAgent) ListAgents(_ context.Context, _ *agentv1.ListAgentsRequest, 
 
 func isHidden(name string) bool { return len(name) > 0 && name[0] == '.' }
 
+// ReadSession honours an allowlist file when a test has written one, so suites that seed
+// WACKYPUB_ALLOWED_AGENTS keep exercising the refusal they were written against. It is an
+// emulation, not fidelity: the real AuthorizeAgentTarget short-circuits to nil at the
+// workspace root marker and gates agent-to-agent calls rather than operator calls, and the
+// spawned server always runs with cwd at that root, so production bot calls are never gated
+// by it. Do not read a passing allowlist test as proof of the server's authorization logic.
 func (f *fakeAgent) ReadSession(_ context.Context, in *agentv1.ReadSessionRequest, _ ...grpc.CallOption) (*agentv1.ReadSessionResponse, error) {
 	for _, dir := range []string{f.wsDir, agentDirIn(f.wsDir, in.GetAgentId())} {
 		if data, err := os.ReadFile(filepath.Join(dir, allowedAgentsFileName)); err == nil {

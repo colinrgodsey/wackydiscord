@@ -1424,3 +1424,74 @@ func TestHandleMessageCreate_TurnStoppedOnCancel(t *testing.T) {
 		t.Errorf("expected NO 'Agent error' message for cancelled turn, got: %v", msgs)
 	}
 }
+
+// TestSessionTurnsWithSeqDropsLegacyUnnumberedTurns pins the migration shape the cursor has
+// to survive: a session whose oldest turns predate sequence numbering. The fixture writer
+// always stamps a seq, so this is the only way to produce the line shape in question, and
+// without it the drop rule in SessionTurnsWithSeq has no coverage at all.
+func TestSessionTurnsWithSeqDropsLegacyUnnumberedTurns(t *testing.T) {
+	ws := t.TempDir()
+	agentDir := filepath.Join(ws, "bob")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	session := "{\"role\":\"user\",\"parts\":[{\"text\":\"written before seq existed\"}]}\n" +
+		"{\"role\":\"model\",\"parts\":[{\"text\":\"legacy reply\"}]}\n" +
+		"{\"role\":\"user\",\"parts\":[{\"text\":\"stamped question\"}],\"seq\":7}\n" +
+		"{\"role\":\"model\",\"parts\":[{\"text\":\"stamped answer\"}],\"seq\":8}\n"
+	if err := os.WriteFile(filepath.Join(agentDir, "session.jsonl"), []byte(session), 0o644); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+
+	fake := newFakeAgent(ws)
+	resp, err := fake.ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: "bob"})
+	if err != nil {
+		t.Fatalf("ReadSession: %v", err)
+	}
+	if len(resp.GetTurns()) != 4 {
+		t.Fatalf("expected the server to return all four turns, got %d", len(resp.GetTurns()))
+	}
+
+	renderable := SessionTurnsWithSeq(resp.GetTurns())
+	if len(renderable) != 2 {
+		t.Fatalf("expected the two unnumbered legacy turns dropped, got %d renderable", len(renderable))
+	}
+	if renderable[0].Seq != 7 || renderable[1].Seq != 8 {
+		t.Errorf("expected seqs 7 and 8, got %d and %d", renderable[0].Seq, renderable[1].Seq)
+	}
+	for _, tr := range renderable {
+		if contentText(tr.Content) == "" {
+			t.Errorf("dropped turn carried no text, so the drop cannot be attributed to seq")
+		}
+	}
+
+	// A cursor mid-range must render only the newer stamped turn, and must not be pulled
+	// backwards by the legacy prefix sitting below it.
+	unsynced, newest, gap := DiffUnsyncedTurns(renderable, 7)
+	if len(unsynced) != 1 || unsynced[0].Seq != 8 || newest != 8 || gap != 0 {
+		t.Errorf("cursor 7: unsynced=%d newest=%d gap=%d", len(unsynced), newest, gap)
+	}
+
+	// A legacy-only session has nothing renderable, so the cursor stays unset and the first
+	// numbered turn the agent writes is what posts.
+	legacyOnly := filepath.Join(ws, "legacyonly")
+	if err := os.MkdirAll(legacyOnly, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyOnly, "session.jsonl"),
+		[]byte("{\"role\":\"user\",\"parts\":[{\"text\":\"old\"}]}\n"), 0o644); err != nil {
+		t.Fatalf("seed legacy-only: %v", err)
+	}
+	legacyResp, err := newFakeAgent(ws).ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: "legacyonly"})
+	if err != nil {
+		t.Fatalf("ReadSession legacy-only: %v", err)
+	}
+	got := SessionTurnsWithSeq(legacyResp.GetTurns())
+	if len(got) != 0 {
+		t.Fatalf("legacy-only session must render nothing, got %d", len(got))
+	}
+	u, n, g := DiffUnsyncedTurns(got, 0)
+	if len(u) != 0 || n != 0 || g != 0 {
+		t.Errorf("legacy-only session must hold the cursor empty: unsynced=%d newest=%d gap=%d", len(u), n, g)
+	}
+}
