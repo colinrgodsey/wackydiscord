@@ -72,15 +72,12 @@ jobs:
         working-directory: tools/wackydiscord
         run: go vet ./...
 
+      - name: Build wackypub binary for bot integration tests
+        working-directory: .
+        run: go build -o /usr/local/bin/wackypub .
+
       - name: Test (race detector enabled)
         working-directory: tools/wackydiscord
         run: |
-          go test ./... -race -count=1 -v 2>&1 | tee /tmp/gotest.log
-          exit ${PIPESTATUS[0]}
+          go test ./... -race -count=1
 
-      - name: Upload test output on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gotest-log
-          path: /tmp/gotest.log
