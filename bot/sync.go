@@ -88,6 +88,13 @@ func DiffUnsyncedTurns(turns []TurnWithSeq, lastSeq int64) (unsynced []TurnWithS
 		return nil, newest, 0
 	}
 
+	if newest < lastSeq {
+		// The session got shorter than the cursor, which means a rollback or a restored
+		// directory. Holding the cursor is the safe direction: lowering it would queue up
+		// turns the channel has already shown.
+		return nil, lastSeq, 0
+	}
+
 	if oldest := turns[0].Seq; oldest > lastSeq+1 {
 		gap = oldest - lastSeq - 1
 	}

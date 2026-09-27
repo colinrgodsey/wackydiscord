@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/colinrgodsey/wackypub/pkg/agent"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 	"google.golang.org/genai"
 )
@@ -94,14 +92,13 @@ func TestStatePersistenceAndConcurrency(t *testing.T) {
 	}
 
 	b1 := &ChannelBinding{
-		ChannelID:     "chan_100",
-		AgentID:       "bob",
-		GuildID:       "guild_1",
-		Verbose:       true,
-		LastTurnIndex: 5,
-		LastTurnHash:  "hash_abc",
-		WebhookID:     "wh_1",
-		WebhookToken:  "tok_1",
+		ChannelID:    "chan_100",
+		AgentID:      "bob",
+		GuildID:      "guild_1",
+		Verbose:      true,
+		WebhookID:    "wh_1",
+		WebhookToken: "tok_1",
+		LastSeq:      7,
 	}
 
 	if err := st.SetBinding(b1); err != nil {
@@ -120,7 +117,7 @@ func TestStatePersistenceAndConcurrency(t *testing.T) {
 		t.Fatalf("NewState re-read failed: %v", err)
 	}
 	got2 := st2.GetBinding("chan_100")
-	if got2 == nil || got2.AgentID != "bob" || got2.LastTurnHash != "hash_abc" {
+	if got2 == nil || got2.AgentID != "bob" || got2.LastSeq != 7 {
 		t.Fatalf("re-read state mismatch: %+v", got2)
 	}
 
@@ -290,82 +287,49 @@ func TestComputeTurnHash(t *testing.T) {
 }
 
 func TestDiffUnsyncedTurns(t *testing.T) {
-	turn0 := &genai.Content{Role: "user", Parts: []*genai.Part{{Text: "turn 0"}}}
-	turn1 := &genai.Content{Role: "model", Parts: []*genai.Part{{Text: "turn 1"}}}
-	turn2 := &genai.Content{Role: "user", Parts: []*genai.Part{{Text: "turn 2"}}}
-	turn3 := &genai.Content{Role: "model", Parts: []*genai.Part{{Text: "turn 3"}}}
+	turn := func(role, text string, seq int64) TurnWithSeq {
+		return TurnWithSeq{Content: &genai.Content{Role: role, Parts: []*genai.Part{{Text: text}}}, Seq: seq}
+	}
+	t1, t2 := turn("user", "t1", 1), turn("model", "t2", 2)
+	t3, t4 := turn("user", "t3", 3), turn("model", "t4", 4)
+	full := []TurnWithSeq{t1, t2, t3, t4}
 
-	turns := []*genai.Content{turn0, turn1, turn2, turn3}
-	h1 := ComputeTurnHash(turn1)
-	h3 := ComputeTurnHash(turn3)
-
-	t.Run("empty session", func(t *testing.T) {
-		unsynced, idx, hash := DiffUnsyncedTurns(nil, "", 0)
-		if len(unsynced) != 0 || idx != 0 || hash != "" {
-			t.Errorf("unexpected diff for empty session")
+	t.Run("empty session leaves the cursor where it was", func(t *testing.T) {
+		unsynced, seq, gap := DiffUnsyncedTurns(nil, 9)
+		if len(unsynced) != 0 || seq != 9 || gap != 0 {
+			t.Errorf("empty session: unsynced=%d seq=%d gap=%d", len(unsynced), seq, gap)
 		}
 	})
 
-	t.Run("brand new binding (lastHash empty)", func(t *testing.T) {
-		unsynced, idx, hash := DiffUnsyncedTurns(turns, "", -1)
-		if len(unsynced) != 0 {
-			t.Errorf("brand new binding should return empty unsynced by default, got %d", len(unsynced))
-		}
-		if idx != 3 || hash != h3 {
-			t.Errorf("expected idx=3 hash=%s, got idx=%d hash=%s", h3, idx, hash)
+	t.Run("no cursor adopts the newest seq and posts nothing", func(t *testing.T) {
+		unsynced, seq, gap := DiffUnsyncedTurns(full, 0)
+		if len(unsynced) != 0 || seq != 4 || gap != 0 {
+			t.Errorf("cold start must not replay: unsynced=%d seq=%d gap=%d", len(unsynced), seq, gap)
 		}
 	})
 
-	t.Run("fast path match at turn 1", func(t *testing.T) {
-		unsynced, idx, hash := DiffUnsyncedTurns(turns, h1, 1)
-		if len(unsynced) != 2 {
-			t.Fatalf("expected 2 unsynced turns (turn2, turn3), got %d", len(unsynced))
-		}
-		if unsynced[0] != turn2 || unsynced[1] != turn3 {
-			t.Errorf("wrong unsynced turns returned")
-		}
-		if idx != 3 || hash != h3 {
-			t.Errorf("expected idx=3 hash=%s, got idx=%d hash=%s", h3, idx, hash)
+	t.Run("turns past the cursor are returned oldest first", func(t *testing.T) {
+		unsynced, seq, gap := DiffUnsyncedTurns(full, 2)
+		if len(unsynced) != 2 || unsynced[0].Seq != 3 || unsynced[1].Seq != 4 || seq != 4 || gap != 0 {
+			t.Errorf("expected t3,t4 then seq=4 gap=0, got %v seq=%d gap=%d", unsynced, seq, gap)
 		}
 	})
 
-	t.Run("compaction index shift (hash scan)", func(t *testing.T) {
-		// Suppose turn0 was pruned by compaction, so turns are now [turn1, turn2, turn3]
-		compactedTurns := []*genai.Content{turn1, turn2, turn3}
-		// old index was 1, but in compacted array turn1 is at index 0
-		unsynced, idx, hash := DiffUnsyncedTurns(compactedTurns, h1, 1)
-		if len(unsynced) != 2 {
-			t.Fatalf("expected 2 unsynced turns, got %d", len(unsynced))
+	t.Run("rewritten prefix is reported as a gap not replayed", func(t *testing.T) {
+		// Compaction replaced the head of the session: only seq 3 and 4 survive.
+		unsynced, seq, gap := DiffUnsyncedTurns([]TurnWithSeq{t3, t4}, 1)
+		if gap != 1 {
+			t.Errorf("expected a one-turn gap for the vanished seq 2, got %d", gap)
 		}
-		if unsynced[0] != turn2 || unsynced[1] != turn3 {
-			t.Errorf("wrong unsynced turns returned")
-		}
-		if idx != 2 || hash != h3 {
-			t.Errorf("expected idx=2 hash=%s, got idx=%d hash=%s", h3, idx, hash)
+		if len(unsynced) != 2 || seq != 4 {
+			t.Errorf("surviving turns must still sync: unsynced=%d seq=%d", len(unsynced), seq)
 		}
 	})
 
-	t.Run("pruned turns from end (hash not found / session shrank)", func(t *testing.T) {
-		// Suppose turns were [turn0, turn1, turn2, turn3] and last synced was turn3 (idx 3, h3).
-		// Now user pruned turn3 and turn2, so only [turn0, turn1] remains.
-		prunedTurns := []*genai.Content{turn0, turn1}
-		unsynced, idx, hash := DiffUnsyncedTurns(prunedTurns, h3, 3)
-		// Must NOT replay turn0 or turn1! Must return 0 unsynced turns and update marker to turn1 (idx 1).
-		if len(unsynced) != 0 {
-			t.Fatalf("expected 0 unsynced turns on pruned session, got %d", len(unsynced))
-		}
-		if idx != 1 || hash != h1 {
-			t.Errorf("expected idx=1 hash=%s, got idx=%d hash=%s", h1, idx, hash)
-		}
-	})
-
-	t.Run("fully synced session", func(t *testing.T) {
-		unsynced, idx, hash := DiffUnsyncedTurns(turns, h3, 3)
-		if len(unsynced) != 0 {
-			t.Fatalf("expected 0 unsynced turns, got %d", len(unsynced))
-		}
-		if idx != 3 || hash != h3 {
-			t.Errorf("expected idx=3 hash=%s, got idx=%d hash=%s", h3, idx, hash)
+	t.Run("a session shorter than the cursor posts nothing and holds it", func(t *testing.T) {
+		unsynced, seq, gap := DiffUnsyncedTurns([]TurnWithSeq{t1, t2}, 4)
+		if len(unsynced) != 0 || seq != 4 || gap != 0 {
+			t.Errorf("rollback must not lower the cursor: unsynced=%d seq=%d gap=%d", len(unsynced), seq, gap)
 		}
 	})
 }
@@ -401,7 +365,7 @@ func TestFormattingHelpers(t *testing.T) {
 
 	t.Run("ExpandScratchpadSentinels", func(t *testing.T) {
 		wsDir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(wsDir, agent.RootMarkerFile), []byte(""), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(wsDir, RootMarkerFile), []byte(""), 0644); err != nil {
 			t.Fatalf("failed writing root marker: %v", err)
 		}
 		bobDir := filepath.Join(wsDir, "bob")
@@ -418,7 +382,7 @@ func TestFormattingHelpers(t *testing.T) {
 		}
 		defer os.Chdir(origCwd)
 
-		sdk := agent.NewSDK(wsDir)
+		sdk := newFakeAgent(wsDir)
 
 		// Create scratchpad entries
 		resp1, err := sdk.CreateScratchpad(context.Background(), &agentv1.CreateScratchpadRequest{
@@ -442,7 +406,7 @@ func TestFormattingHelpers(t *testing.T) {
 
 		// 1. Single sentinel expansion
 		rawText1 := fmt.Sprintf("Prologue:\n<SCRATCHPAD_EXPAND id=%q />", entry1.GetEntryId())
-		expanded1 := ExpandScratchpadSentinels(sdk, "bob", rawText1)
+		expanded1 := ExpandScratchpadSentinels(sdk, "bob", "", rawText1)
 		expected1 := fmt.Sprintf("Prologue:\n%s", "The rain fell heavily across Neo-Tokyo.")
 		if expanded1 != expected1 {
 			t.Errorf("expected %q, got %q", expected1, expanded1)
@@ -450,7 +414,7 @@ func TestFormattingHelpers(t *testing.T) {
 
 		// 2. Multiple sentinels with mixed case and quote styles
 		rawText2 := fmt.Sprintf("Chapter 1:\n<SCRATCHPAD_EXPAND id=%q/>\nChapter 2:\n<scratchpad_expand id='%s' />", entry1.GetEntryId(), entry2.GetEntryId())
-		expanded2 := ExpandScratchpadSentinels(sdk, "bob", rawText2)
+		expanded2 := ExpandScratchpadSentinels(sdk, "bob", "", rawText2)
 		expected2 := "Chapter 1:\nThe rain fell heavily across Neo-Tokyo.\nChapter 2:\nA shadow stepped out from the alley."
 		if expanded2 != expected2 {
 			t.Errorf("expected %q, got %q", expected2, expanded2)
@@ -458,20 +422,20 @@ func TestFormattingHelpers(t *testing.T) {
 
 		// 3. Graceful fallback on missing/invalid ID
 		rawText3 := "Unknown entry: <SCRATCHPAD_EXPAND id=\"nonexistent\" />"
-		expanded3 := ExpandScratchpadSentinels(sdk, "bob", rawText3)
+		expanded3 := ExpandScratchpadSentinels(sdk, "bob", "", rawText3)
 		if expanded3 != rawText3 {
 			t.Errorf("expected missing ID to remain unexpanded %q, got %q", rawText3, expanded3)
 		}
 
 		// 4. Pass-through for text without sentinels
 		plainText := "Just a normal conversational turn."
-		if s := ExpandScratchpadSentinels(sdk, "bob", plainText); s != plainText {
+		if s := ExpandScratchpadSentinels(sdk, "bob", "", plainText); s != plainText {
 			t.Errorf("expected unchanged text, got %q", s)
 		}
 	})
 }
 
-func TestSessionWatcher(t *testing.T) {
+func TestSessionFeedWatchLifecycle(t *testing.T) {
 	tmpDir := t.TempDir()
 	agentDir := filepath.Join(tmpDir, "bob")
 	if err := os.MkdirAll(agentDir, 0755); err != nil {
@@ -479,68 +443,68 @@ func TestSessionWatcher(t *testing.T) {
 	}
 
 	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
+
 	st, err := NewState(stateFile)
 	if err != nil {
 		t.Fatalf("NewState failed: %v", err)
 	}
-
-	_ = st.SetBinding(&ChannelBinding{
-		ChannelID: "chan_1",
-		AgentID:   "bob",
-	})
-
-	b := &Bot{
-		WsDir: tmpDir,
-		State: st,
+	if err := st.SetBinding(&ChannelBinding{ChannelID: "chan_1", AgentID: "bob"}); err != nil {
+		t.Fatalf("SetBinding failed: %v", err)
 	}
 
-	watcher, err := NewSessionWatcher(b)
-	if err != nil {
-		t.Fatalf("NewSessionWatcher failed: %v", err)
-	}
-	defer watcher.Close()
+	b := &Bot{WsDir: tmpDir, State: st, Client: newFakeAgent(tmpDir)}
+	feed := newSessionFeed(b)
+	defer feed.close()
 
-	if err := watcher.WatchAgent("bob"); err != nil {
-		t.Fatalf("WatchAgent failed: %v", err)
+	feed.watch("bob")
+	feed.watch("bob")
+	feed.mu.Lock()
+	watched := feed.want["bob"]
+	feed.mu.Unlock()
+	if !watched {
+		t.Errorf("expected bob to be watched after binding")
 	}
 
-	// Verify unwatch
-	watcher.UnwatchAgent("nonexistent")
-	if !watcher.watchedDirs[agentDir] {
+	// Unwatching something never watched must not disturb the agents that are.
+	feed.unwatch("nonexistent")
+	feed.mu.Lock()
+	stillWatched := feed.want["bob"]
+	feed.mu.Unlock()
+	if !stillWatched {
 		t.Errorf("expected bob to still be watched")
 	}
 
 	_ = st.RemoveBinding("chan_1")
-	watcher.UnwatchAgent("bob")
-	if watcher.watchedDirs[agentDir] {
+	feed.unwatch("bob")
+	feed.mu.Lock()
+	watchedAfter := feed.want["bob"]
+	feed.mu.Unlock()
+	if watchedAfter {
 		t.Errorf("expected bob to be unwatched after removing binding")
 	}
 }
 
 func TestPendingUserEchoSuppression(t *testing.T) {
 	prevTurn := genai.NewContentFromText("prev message", "model")
-	prevHash := ComputeTurnHash(prevTurn)
 
 	userMsg := "What is the status of sector 7?"
 	userTurn := genai.NewContentFromText(userMsg, "user")
 	userHash := ComputeTurnHash(userTurn)
 
 	binding := &ChannelBinding{
-		ChannelID:     "chan_10",
-		AgentID:       "bob",
-		LastTurnIndex: 0,
-		LastTurnHash:  prevHash,
+		ChannelID: "chan_10",
+		AgentID:   "bob",
 	}
 	binding.AddPendingUserHash(userHash)
 
-	turns := []*genai.Content{prevTurn, userTurn}
-	unsynced, _, _ := DiffUnsyncedTurns(turns, binding.LastTurnHash, binding.LastTurnIndex)
+	turns := []TurnWithSeq{{Content: prevTurn, Seq: 1}, {Content: userTurn, Seq: 2}}
+	unsynced, _, _ := DiffUnsyncedTurns(turns, 1)
 	if len(unsynced) != 1 {
 		t.Fatalf("expected 1 unsynced turn, got %d", len(unsynced))
 	}
 
 	// Verify matching and consumption
-	turnHash := ComputeTurnHash(unsynced[0])
+	turnHash := ComputeTurnHash(unsynced[0].Content)
 	if !binding.ConsumePendingUserHash(turnHash) {
 		t.Errorf("expected turnHash to match and be consumed from PendingUserHashes")
 	}
@@ -660,9 +624,9 @@ func TestHandleMessageCreate_UnbindingRaceAndNilCheck(t *testing.T) {
 	}
 
 	b := &Bot{
-		WsDir: tmpDir,
-		State: st,
-		SDK:   agent.NewSDK(tmpDir),
+		WsDir:  tmpDir,
+		State:  st,
+		Client: newFakeAgent(tmpDir),
 	}
 
 	// 1. Unbound channel -> fast pre-lock check returns cleanly
@@ -747,7 +711,7 @@ func TestAutoFillUnsyncedTurns_Limit(t *testing.T) {
 	}
 	defer os.Chdir(origCwd)
 
-	sdk := agent.NewSDK(tmpDir)
+	sdk := newFakeAgent(tmpDir)
 
 	// Append 4 turns: user1, model1, user2, model2
 	t1 := genai.NewContentFromText("user msg 1", "user")
@@ -755,10 +719,10 @@ func TestAutoFillUnsyncedTurns_Limit(t *testing.T) {
 	t3 := genai.NewContentFromText("user msg 2", "user")
 	t4 := genai.NewContentFromText("model resp 2", "model")
 
-	_ = agent.AppendSessionContent(bobDir, t1)
-	_ = agent.AppendSessionContent(bobDir, t2)
-	_ = agent.AppendSessionContent(bobDir, t3)
-	_ = agent.AppendSessionContent(bobDir, t4)
+	_ = appendSessionContent(bobDir, t1)
+	_ = appendSessionContent(bobDir, t2)
+	_ = appendSessionContent(bobDir, t3)
+	_ = appendSessionContent(bobDir, t4)
 
 	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
 	st, err := NewState(stateFile)
@@ -767,17 +731,15 @@ func TestAutoFillUnsyncedTurns_Limit(t *testing.T) {
 	}
 
 	b := &Bot{
-		WsDir: tmpDir,
-		State: st,
-		SDK:   sdk,
+		WsDir:  tmpDir,
+		State:  st,
+		Client: sdk,
 	}
 
 	// 1. limit = 2 on a fully synced session (simulating /fill limit:2)
 	binding := &ChannelBinding{
-		ChannelID:     "chan_test",
-		AgentID:       "bob",
-		LastTurnIndex: 3,
-		LastTurnHash:  ComputeTurnHash(t4),
+		ChannelID: "chan_test",
+		AgentID:   "bob",
 	}
 	_ = st.SetBinding(binding)
 
@@ -790,8 +752,7 @@ func TestAutoFillUnsyncedTurns_Limit(t *testing.T) {
 	}
 
 	// 2. limit = 10 on unsynced session (caps at total 4 turns)
-	binding.LastTurnIndex = -1
-	binding.LastTurnHash = ""
+	binding.LastSeq = 0
 	_ = st.SetBinding(binding)
 
 	count, err = b.autoFillUnsyncedTurns(nil, binding, "chan_test", 10)
@@ -803,8 +764,7 @@ func TestAutoFillUnsyncedTurns_Limit(t *testing.T) {
 	}
 
 	// 3. Under D89, autoFillUnsyncedTurns does NOT block when IsGenerating is true
-	binding.LastTurnIndex = 1
-	binding.LastTurnHash = ComputeTurnHash(t2)
+	binding.LastSeq = 2
 	binding.IsGenerating = true
 	_ = st.SetBinding(binding)
 
@@ -839,9 +799,9 @@ func TestHandleFillCommand_Locking(t *testing.T) {
 	}
 
 	b := &Bot{
-		WsDir: tmpDir,
-		State: st,
-		SDK:   agent.NewSDK(tmpDir),
+		WsDir:  tmpDir,
+		State:  st,
+		Client: newFakeAgent(tmpDir),
 	}
 
 	// 1. /fill on unbound channel
@@ -926,9 +886,9 @@ func TestHandleUnbindCommand_Locking(t *testing.T) {
 	}
 
 	b := &Bot{
-		WsDir: tmpDir,
-		State: st,
-		SDK:   agent.NewSDK(tmpDir),
+		WsDir:  tmpDir,
+		State:  st,
+		Client: newFakeAgent(tmpDir),
 	}
 
 	// 1. /unbind on unbound channel
@@ -1018,9 +978,9 @@ func TestHandleBindCommand_Locking(t *testing.T) {
 	}
 
 	b := &Bot{
-		WsDir: tmpDir,
-		State: st,
-		SDK:   agent.NewSDK(tmpDir),
+		WsDir:  tmpDir,
+		State:  st,
+		Client: newFakeAgent(tmpDir),
 	}
 
 	// 1. handleBindCommand blocks when LockChannelTurn is held
@@ -1114,9 +1074,9 @@ func TestHandleBindCommand_RejectsBindOnReadSessionError(t *testing.T) {
 	}
 
 	b := &Bot{
-		WsDir: tmpDir,
-		State: st,
-		SDK:   agent.NewSDK(tmpDir),
+		WsDir:  tmpDir,
+		State:  st,
+		Client: newFakeAgent(tmpDir),
 	}
 
 	channelID := "chan_bind_rejected"
@@ -1156,8 +1116,8 @@ func TestHandleMessageCreate_AgentIDGuardMidGeneration(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bobDir, "AGENTS.md"), []byte("I am Bob"), 0644); err != nil {
 		t.Fatalf("failed writing bob AGENTS.md: %v", err)
 	}
-	_ = agent.AppendSessionContent(bobDir, genai.NewContentFromText("bob turn 1", "user"))
-	_ = agent.AppendSessionContent(bobDir, genai.NewContentFromText("bob turn 2", "model"))
+	_ = appendSessionContent(bobDir, genai.NewContentFromText("bob turn 1", "user"))
+	_ = appendSessionContent(bobDir, genai.NewContentFromText("bob turn 2", "model"))
 
 	// 2. Create agent 'alice' with 5 session turns
 	aliceDir := filepath.Join(tmpDir, "alice")
@@ -1168,7 +1128,7 @@ func TestHandleMessageCreate_AgentIDGuardMidGeneration(t *testing.T) {
 		t.Fatalf("failed writing alice AGENTS.md: %v", err)
 	}
 	for j := 0; j < 5; j++ {
-		_ = agent.AppendSessionContent(aliceDir, genai.NewContentFromText(fmt.Sprintf("alice turn %d", j), "user"))
+		_ = appendSessionContent(aliceDir, genai.NewContentFromText(fmt.Sprintf("alice turn %d", j), "user"))
 	}
 
 	origCwd, _ := os.Getwd()
@@ -1184,22 +1144,20 @@ func TestHandleMessageCreate_AgentIDGuardMidGeneration(t *testing.T) {
 	}
 
 	b := &Bot{
-		WsDir: tmpDir,
-		State: st,
-		SDK:   agent.NewSDK(tmpDir),
+		WsDir:  tmpDir,
+		State:  st,
+		Client: newFakeAgent(tmpDir),
 	}
 
 	// Channel initially bound to bob
 	_ = st.SetBinding(&ChannelBinding{
-		ChannelID:     "chan_rebind",
-		AgentID:       "bob",
-		LastTurnIndex: 1,
-		LastTurnHash:  "bob_hash_1",
+		ChannelID: "chan_rebind",
+		AgentID:   "bob",
 	})
 
 	// Hold session lock on bobDir so HandleMessageCreate pauses while IsGenerating is true,
 	// allowing us to deterministically simulate a concurrent rebind to alice mid-generation.
-	lock, err := agent.AcquireSessionLock(bobDir)
+	lock, err := acquireSessionLock(bobDir)
 	if err != nil {
 		t.Fatalf("AcquireSessionLock failed: %v", err)
 	}
@@ -1227,10 +1185,9 @@ func TestHandleMessageCreate_AgentIDGuardMidGeneration(t *testing.T) {
 
 	// Rebind channel to alice while bob is mid-generation
 	_ = st.SetBinding(&ChannelBinding{
-		ChannelID:     "chan_rebind",
-		AgentID:       "alice",
-		LastTurnIndex: 4,
-		LastTurnHash:  "alice_hash_4",
+		ChannelID: "chan_rebind",
+		AgentID:   "alice",
+		LastSeq:   4,
 	})
 
 	// Release bob's lock so HandleMessageCreate can proceed and finish
@@ -1251,11 +1208,8 @@ func TestHandleMessageCreate_AgentIDGuardMidGeneration(t *testing.T) {
 	if finalBnd.AgentID != "alice" {
 		t.Errorf("expected AgentID to be alice, got %q", finalBnd.AgentID)
 	}
-	if finalBnd.LastTurnIndex != 4 {
-		t.Errorf("expected LastTurnIndex to remain 4 (alice), got %d (corrupted by bob's generation)", finalBnd.LastTurnIndex)
-	}
-	if finalBnd.LastTurnHash != "alice_hash_4" {
-		t.Errorf("expected LastTurnHash to remain alice_hash_4, got %q", finalBnd.LastTurnHash)
+	if finalBnd.LastSeq != 4 {
+		t.Errorf("expected LastSeq to remain 4 (alice), got %d (corrupted by bob's generation)", finalBnd.LastSeq)
 	}
 }
 
@@ -1273,11 +1227,11 @@ func TestStopCommand(t *testing.T) {
 		t.Fatalf("NewState failed: %v", err)
 	}
 
-	sdk := agent.NewSDK(tmpDir)
+	sdk := newFakeAgent(tmpDir)
 	b := &Bot{
-		WsDir: tmpDir,
-		State: st,
-		SDK:   sdk,
+		WsDir:  tmpDir,
+		State:  st,
+		Client: sdk,
 	}
 
 	var capturedResponse string
@@ -1333,45 +1287,29 @@ func TestStopCommand(t *testing.T) {
 	}
 
 	// 3. Bound channel with an in-flight turn:
-	bobDir := filepath.Join(tmpDir, "bob")
-	if err := os.MkdirAll(bobDir, 0755); err != nil {
-		t.Fatalf("MkdirAll failed: %v", err)
-	}
-	_ = os.WriteFile(filepath.Join(bobDir, "AGENTS.md"), []byte("Bob system prompt"), 0644)
-	_ = os.WriteFile(filepath.Join(bobDir, agent.AllowedAgentsFile), []byte("bob\n"), 0644)
-
-	requestStarted := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.ReadAll(r.Body)
-		close(requestStarted)
-		<-r.Context().Done()
-	}))
-	defer srv.Close()
-
-	runtimeJSON := fmt.Sprintf(`{"model":"test-model","endpoint":%q}`, srv.URL)
-	_ = os.WriteFile(filepath.Join(bobDir, "runtime.json"), []byte(runtimeJSON), 0644)
-
-	origCwd, _ := os.Getwd()
-	_ = os.Chdir(bobDir)
-	defer os.Chdir(origCwd)
+	sdk.hold = make(chan struct{})
+	sdk.started = make(chan struct{})
 
 	streamDone := make(chan struct{})
 	go func() {
 		defer close(streamDone)
-		stream := agent.NewInProcessStream[agentv1.AddAndGenerateTurnStreamResponse](context.Background(), 16)
-		go func() {
-			defer stream.Close()
-			_ = sdk.AddAndGenerateTurnStream(&agentv1.AddAndGenerateTurnStreamRequest{
-				AgentId:     "bob",
-				UserMessage: "Hello",
-			}, stream)
-		}()
-		for range stream.Chunks() {
+		stream, err := sdk.GenerateTurnStream(context.Background(), &agentv1.GenerateTurnStreamRequest{
+			AgentId:      "bob",
+			WorkspaceDir: tmpDir,
+		})
+		if err != nil {
+			return
+		}
+		for {
+			_, err := stream.Recv()
+			if err != nil {
+				return
+			}
 		}
 	}()
 
 	select {
-	case <-requestStarted:
+	case <-sdk.started:
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for request to start")
 	}
@@ -1398,27 +1336,10 @@ func TestHandleMessageCreate_TurnStoppedOnCancel(t *testing.T) {
 		t.Fatalf("NewState failed: %v", err)
 	}
 
-	bobDir := filepath.Join(tmpDir, "bob")
+	bobDir := agentDirIn(tmpDir, "bob")
 	if err := os.MkdirAll(bobDir, 0755); err != nil {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
-	_ = os.WriteFile(filepath.Join(bobDir, "AGENTS.md"), []byte("Bob prompt"), 0644)
-	_ = os.WriteFile(filepath.Join(bobDir, agent.AllowedAgentsFile), []byte("bob\n"), 0644)
-
-	requestStarted := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.ReadAll(r.Body)
-		close(requestStarted)
-		<-r.Context().Done()
-	}))
-	defer srv.Close()
-
-	runtimeJSON := fmt.Sprintf(`{"model":"test-model","endpoint":%q}`, srv.URL)
-	_ = os.WriteFile(filepath.Join(bobDir, "runtime.json"), []byte(runtimeJSON), 0644)
-
-	origCwd, _ := os.Getwd()
-	_ = os.Chdir(bobDir)
-	defer os.Chdir(origCwd)
 
 	_ = st.SetBinding(&ChannelBinding{
 		ChannelID: "chan_stop_msg",
@@ -1442,11 +1363,13 @@ func TestHandleMessageCreate_TurnStoppedOnCancel(t *testing.T) {
 		}, nil
 	})
 
-	sdk := agent.NewSDK(tmpDir)
+	sdk := newFakeAgent(tmpDir)
+	sdk.hold = make(chan struct{})
+	sdk.started = make(chan struct{})
 	b := &Bot{
-		WsDir: tmpDir,
-		State: st,
-		SDK:   sdk,
+		WsDir:  tmpDir,
+		State:  st,
+		Client: sdk,
 	}
 
 	done := make(chan struct{})
@@ -1463,13 +1386,13 @@ func TestHandleMessageCreate_TurnStoppedOnCancel(t *testing.T) {
 	}()
 
 	select {
-	case <-requestStarted:
+	case <-sdk.started:
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for turn to start")
 	}
 
 	// Cancel the turn via SDK
-	if _, err := b.SDK.CancelTurn(context.Background(), &agentv1.CancelTurnRequest{AgentId: "bob"}); err != nil {
+	if _, err := b.Client.CancelTurn(context.Background(), &agentv1.CancelTurnRequest{AgentId: "bob"}); err != nil {
 		t.Fatalf("CancelTurn failed: %v", err)
 	}
 

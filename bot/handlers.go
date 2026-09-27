@@ -259,7 +259,7 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 
 	// The turn grew the session, so nudge the feed rather than waiting for the next push:
 	// the subscription may already have delivered its event before this turn finished writing.
-	b.feed.trigger(binding.AgentID)
+	b.feed.flushNow(binding.AgentID)
 
 	if streamErr != nil {
 		if errors.Is(streamErr, context.Canceled) || strings.Contains(streamErr.Error(), "context canceled") {
@@ -337,6 +337,11 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 
 	if len(unsynced) == 0 {
 		if bnd.LastSeq == 0 && newSeq > 0 {
+			for _, t := range turns {
+				if t.Content != nil {
+					bnd.ConsumePendingUserHash(ComputeTurnHash(t.Content))
+				}
+			}
 			bnd.LastSeq = newSeq
 			if err := b.State.SetBinding(bnd); err != nil {
 				log.Printf("⚠️ failed to persist initial sync cursor: %v", err)

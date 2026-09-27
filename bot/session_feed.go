@@ -189,6 +189,16 @@ func (f *sessionFeed) consume(ctx context.Context, agentID string, stream agentv
 	}
 }
 
+// flushNow runs the sync pass for agentID immediately, bypassing the coalescing window. The
+// turn handler uses it because it just grew the session itself and the next push may already
+// have been consumed before the write landed.
+func (f *sessionFeed) flushNow(agentID string) {
+	if f == nil || agentID == "" {
+		return
+	}
+	f.bot.SyncAgentToChannels(agentID)
+}
+
 // worker is the single renderer: it waits for a change, sleeps out the coalescing window so
 // a turn's events collapse into one pass, then syncs every channel of every pending agent.
 func (f *sessionFeed) worker(ctx context.Context) {

@@ -13,7 +13,6 @@ import (
 	"testing"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/colinrgodsey/wackypub/pkg/agent"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 )
 
@@ -114,7 +113,7 @@ func setupTestBotWithSpy(t *testing.T) (*Bot, *string, *discordgo.MessageFlags) 
 		Session: s,
 		WsDir:   tmpDir,
 		State:   st,
-		SDK:     agent.NewSDK(tmpDir),
+		Client:  newFakeAgent(tmpDir),
 	}
 
 	return b, &capturedResponse, &capturedFlags
@@ -374,7 +373,7 @@ func TestMessage_NonOwnerSilentlyIgnored(t *testing.T) {
 	}
 
 	// Verify no session turns were recorded
-	res, _ := b.SDK.ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: "bob"})
+	res, _ := b.Client.ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: "bob"})
 	if res != nil && len(res.GetTurns()) != 0 {
 		t.Fatalf("expected 0 session turns for agent bob, got %d", len(res.GetTurns()))
 	}
