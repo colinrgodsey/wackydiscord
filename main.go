@@ -9,7 +9,6 @@ import (
 	"syscall"
 
 	"github.com/colinrgodsey/wackydiscord/bot"
-	"github.com/colinrgodsey/wackypub/pkg/agent"
 	"github.com/spf13/cobra"
 )
 
@@ -24,6 +23,7 @@ var (
 	flagGuildID       string
 	flagDefaultOpen   bool
 	flagDefaultPolicy string
+	flagWackypubBin   string
 )
 
 var rootCmd = &cobra.Command{
@@ -34,7 +34,7 @@ It supports channel-to-agent bindings (/bind), session backfilling (/fill),
 webhook persona impersonation, and real-time interactive conversations.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		isExplicit := cmd.Flags().Changed("ws")
-		wsDir, err := agent.ResolveWorkspaceDir(flagWs, isExplicit)
+		wsDir, err := bot.ResolveWorkspaceDir(flagWs, isExplicit)
 		if err != nil {
 			return fmt.Errorf("invalid workspace: %w", err)
 		}
@@ -58,6 +58,7 @@ webhook persona impersonation, and real-time interactive conversations.`,
 			StateFilePath: flagStateFile,
 			GuildID:       flagGuildID,
 			DefaultOpen:   defaultOpenPtr,
+			WackypubBin:   flagWackypubBin,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to initialize wackydiscord bot: %w", err)
@@ -78,6 +79,7 @@ func init() {
 	rootCmd.Flags().String("token", "", "removed: set "+EnvDiscordBotToken+" instead")
 	_ = rootCmd.Flags().MarkHidden("token")
 	rootCmd.Flags().StringVar(&flagStateFile, "state-file", "", "Custom state file path (default: <ws_dir>/.wackydiscord.json)")
+	rootCmd.Flags().StringVar(&flagWackypubBin, "wackypub-bin", bot.DefaultWackypubBin, "Path to the wackypub binary spawned to serve the agent protocol")
 	rootCmd.Flags().StringVar(&flagGuildID, "guild-id", "", "Optional: register slash commands immediately to a specific guild ID")
 	rootCmd.Flags().StringVar(&flagDefaultPolicy, "default-policy", "open", "Allowlist policy when unclaimed: 'open' or 'closed'")
 	rootCmd.Flags().BoolVar(&flagDefaultOpen, "default-open", true, "Allow interaction before bot is claimed (starting default: true)")

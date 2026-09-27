@@ -8,8 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"io"
+
 	"github.com/bwmarrin/discordgo"
-	"github.com/colinrgodsey/wackypub/pkg/agent"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 	"google.golang.org/genai"
 )
@@ -64,7 +65,7 @@ func (b *Bot) resolveMessageContext(s *discordgo.Session, channelID string) (*Ch
 	}
 
 	// Verify bound agent exists and has valid configuration
-	insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID})
+	insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
 	if err != nil || insp == nil || !insp.GetAgentDirExists() {
 		b.say(s, channelID, "System", fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`. Use `/bind <agent_id>` to connect a valid agent.", binding.AgentID, b.WsDir), nil)
 		return nil, false
@@ -156,9 +157,10 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 
 	// Perform AddUserTurn WITHOUT holding LockChannelSync. Holding LockChannelSync across
 	// AddUserTurn deadlocks with callers that hold agent session locks and rebind channels.
-	res, addErr := b.SDK.AddUserTurn(context.Background(), &agentv1.AddUserTurnRequest{
-		AgentId: binding.AgentID,
-		Message: userText,
+	res, addErr := b.Client.AddUserTurn(context.Background(), &agentv1.AddUserTurnRequest{
+		AgentId:      binding.AgentID,
+		Message:      userText,
+		WorkspaceDir: b.WsDir,
 	})
 	if addErr != nil {
 		b.say(s, m.ChannelID, "System", fmt.Sprintf("❌ **Turn error:** %v", addErr), nil)
@@ -180,10 +182,6 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 				freshBnd.AddPendingUserHash(actualHash)
 			}
 			freshBnd.IsGenerating = true
-			if freshBnd.LastTurnHash == "" {
-				freshBnd.LastTurnIndex = 0
-				freshBnd.LastTurnHash = actualHash
-			}
 			if err := b.State.SetBinding(freshBnd); err != nil {
 				log.Printf("⚠️ failed to persist IsGenerating state in channel %s: %v", m.ChannelID, err)
 			}
@@ -216,12 +214,13 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 
 		ctx := context.Background()
 
-		stream := agent.NewInProcessStream[agentv1.GenerateTurnStreamResponse](ctx, 16)
-		errCh := make(chan error, 1)
-		go func() {
-			defer stream.Close()
-			errCh <- b.SDK.GenerateTurnStream(&agentv1.GenerateTurnStreamRequest{AgentId: binding.AgentID}, stream)
-		}()
+		turnStream, streamErr := b.Client.GenerateTurnStream(ctx, &agentv1.GenerateTurnStreamRequest{
+			AgentId:      binding.AgentID,
+			WorkspaceDir: b.WsDir,
+		})
+		if streamErr != nil {
+			return streamErr
+		}
 
 		// D112 tool-call visibility: live tool activity is rendered straight off the
 		// stream. Message text stays with the SessionWatcher, so the two renderers never
@@ -235,10 +234,16 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 			toolActivity = NewToolActivity(newChannelPoster(s, m.ChannelID, liveBnd))
 			defer toolActivity.Finish()
 		}
-		for resp := range stream.Chunks() {
+		for {
+			resp, err := turnStream.Recv()
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
 			toolActivity.Observe(resp)
 		}
-		return <-errCh
 	})
 
 	func() {
@@ -252,10 +257,9 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 		}
 	}()
 
-	// Synchronously call FlushNow to flush any remaining turns without waiting for 400ms trailing timer
-	if b.Watcher != nil {
-		b.Watcher.FlushNow(binding.AgentID)
-	}
+	// The turn grew the session, so nudge the feed rather than waiting for the next push:
+	// the subscription may already have delivered its event before this turn finished writing.
+	b.feed.trigger(binding.AgentID)
 
 	if streamErr != nil {
 		if errors.Is(streamErr, context.Canceled) || strings.Contains(streamErr.Error(), "context canceled") {
@@ -304,22 +308,24 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		return 0, nil
 	}
 
-	if _, err := b.SDK.ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: bnd.AgentID}); err != nil {
-		syncUnlock()
-		return 0, fmt.Errorf("failed to read session turns: %w", err)
-	}
-
-	turns, err := agent.ReadSessionTurns(b.SDK.AgentDir(bnd.AgentID))
+	resp, err := b.Client.ReadSession(context.Background(), &agentv1.ReadSessionRequest{
+		AgentId:      bnd.AgentID,
+		WorkspaceDir: b.WsDir,
+	})
 	if err != nil {
 		syncUnlock()
 		return 0, fmt.Errorf("failed to read session turns: %w", err)
 	}
+	turns := SessionTurnsWithSeq(resp.GetTurns())
 	if len(turns) == 0 {
 		syncUnlock()
 		return 0, nil
 	}
 
-	unsynced, newIdx, newHash := DiffUnsyncedTurns(turns, bnd.LastTurnHash, bnd.LastTurnIndex)
+	unsynced, newSeq, gap := DiffUnsyncedTurns(turns, bnd.LastSeq)
+	if gap > 0 {
+		log.Printf("⚠️ channel %s could not verify %d turns older than cursor %d; they are outside the retained session", channelID, gap, bnd.LastSeq)
+	}
 	if limit > 0 && len(unsynced) == 0 && len(turns) > 0 {
 		if limit > len(turns) {
 			limit = len(turns)
@@ -330,12 +336,10 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 	}
 
 	if len(unsynced) == 0 {
-		if bnd.LastTurnHash == "" && newHash != "" {
-			bnd.ConsumePendingUserHash(newHash)
-			bnd.LastTurnIndex = newIdx
-			bnd.LastTurnHash = newHash
+		if bnd.LastSeq == 0 && newSeq > 0 {
+			bnd.LastSeq = newSeq
 			if err := b.State.SetBinding(bnd); err != nil {
-				log.Printf("⚠️ failed to persist initial sync markers: %v", err)
+				log.Printf("⚠️ failed to persist initial sync cursor: %v", err)
 			}
 		}
 		syncUnlock()
@@ -352,20 +356,18 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 	// arrived, the tail is a genuine orphan and renders per existing backfill semantics.
 	deferredTail := false
 	if bnd.IsGenerating && len(unsynced) > 0 {
-		if last := unsynced[len(unsynced)-1]; last.Role == "user" && !IsSyntheticHarnessTurn(last) && strings.TrimSpace(agent.ContentText(last)) != "" {
+		if last := unsynced[len(unsynced)-1]; last.Content != nil && last.Content.Role == "user" && !IsSyntheticHarnessTurn(last.Content) && strings.TrimSpace(contentText(last.Content)) != "" {
 			// Only a text-bearing user turn can echo back as a [User Turn] message. Tool-response
-			// turns share the user role but carry FunctionResponse parts with empty ContentText;
+			// turns share the user role but carry FunctionResponse parts with empty contentText;
 			// deferring those would stall the tool-cycle watermark mid-generation.
 			deferredTail = true
 			unsynced = unsynced[:len(unsynced)-1]
-			// Do not advance the watermark past the deferred user turn; the next sync must
-			// re-see it (paired with its assistant, or orphaned after generation clears).
-			if newIdx-1 >= 0 {
-				newIdx = newIdx - 1
-				newHash = ComputeTurnHash(turns[newIdx])
+			// Hold the cursor at the newest turn actually rendered, so the next pass re-sees the
+			// deferred tail whether it ends up paired with an assistant turn or orphaned.
+			if len(unsynced) > 0 {
+				newSeq = unsynced[len(unsynced)-1].Seq
 			} else {
-				newIdx = -1
-				newHash = ""
+				newSeq = bnd.LastSeq
 			}
 		}
 	}
@@ -382,7 +384,8 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 	}
 	var toProcess []turnItem
 
-	for _, turn := range unsynced {
+	for _, t := range unsynced {
+		turn := t.Content
 		if turn == nil {
 			continue
 		}
@@ -396,8 +399,7 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		toProcess = append(toProcess, turnItem{turn: turn, isEcho: false})
 	}
 
-	bnd.LastTurnIndex = newIdx
-	bnd.LastTurnHash = newHash
+	bnd.LastSeq = newSeq
 	if err := b.State.SetBinding(bnd); err != nil {
 		syncUnlock()
 		return 0, fmt.Errorf("failed to update binding sync markers: %w", err)
@@ -439,11 +441,46 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		} else {
 			text := FormatAssistantBackfillMessage(turn)
 			if text != "" {
-				text = ExpandScratchpadSentinels(b.SDK, agentID, text)
+				text = ExpandScratchpadSentinels(b.Client, agentID, b.WsDir, text)
 				b.say(s, channelID, agentID, text, wh)
 			}
 		}
 	}
 
 	return len(unsynced), nil
+}
+
+// adoptSeqCursor re-points every channel bound to agentID at the newest turn in its session
+// without posting anything. It is what a rewind or rollback needs: the old cursor refers to a
+// history that no longer exists, and the turns now on disk were already rendered or predate
+// the binding, so neither should be replayed into the channel.
+func (b *Bot) adoptSeqCursor(agentID string) {
+	for _, binding := range b.State.GetAllBindings() {
+		if binding.AgentID != agentID {
+			continue
+		}
+		unlock := b.State.LockChannelSync(binding.ChannelID)
+		bnd := b.State.GetBinding(binding.ChannelID)
+		if bnd == nil || bnd.AgentID != agentID {
+			unlock()
+			continue
+		}
+		resp, err := b.Client.ReadSession(context.Background(), &agentv1.ReadSessionRequest{
+			AgentId:      agentID,
+			WorkspaceDir: b.WsDir,
+		})
+		if err != nil {
+			log.Printf("⚠️ could not adopt sync cursor for channel %s: %v", binding.ChannelID, err)
+			unlock()
+			continue
+		}
+		turns := SessionTurnsWithSeq(resp.GetTurns())
+		if len(turns) > 0 {
+			bnd.LastSeq = turns[len(turns)-1].Seq
+			if err := b.State.SetBinding(bnd); err != nil {
+				log.Printf("⚠️ failed to persist adopted sync cursor in channel %s: %v", binding.ChannelID, err)
+			}
+		}
+		unlock()
+	}
 }

@@ -9,9 +9,7 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/colinrgodsey/wackypub/pkg/agent"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
-	"google.golang.org/genai"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -247,9 +245,9 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 
 	// Verify agent exists
-	insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: agentID})
+	insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: agentID})
 	if err != nil || insp == nil || !insp.GetAgentDirExists() {
-		listResp, listErr := b.SDK.ListAgents(context.Background(), &agentv1.ListAgentsRequest{})
+		listResp, listErr := b.Client.ListAgents(context.Background(), &agentv1.ListAgentsRequest{})
 		availStr := "none"
 		if listErr != nil {
 			availStr = fmt.Sprintf("could not read the workspace, listing failed: %v", listErr)
@@ -267,8 +265,8 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 
 	modelName := "default"
 	if insp.GetRuntimeJsonValid() {
-		if cfg, err := agent.LoadRuntimeConfig(insp.GetAgentDir()); err == nil && cfg != nil && cfg.Model != "" {
-			modelName = cfg.Model
+		if m, _ := runtimeSummary(insp.GetAgentDir()); m != "" {
+			modelName = m
 		}
 	}
 
@@ -283,29 +281,25 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	// rather than seed an empty baseline: lastIdx -1 looks identical to "nothing has been
 	// synced yet", and the next sync pass would then replay the agent's entire history into
 	// the channel as unsynced turns.
-	readResp, err := b.SDK.ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: agentID})
+	readResp, err := b.Client.ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: agentID, WorkspaceDir: b.WsDir})
 	if err != nil {
 		b.respondInteraction(s, i, fmt.Sprintf("❌ Failed to read session history for agent %q, refusing to bind with an unknown baseline: %v", agentID, err), true)
 		return
 	}
-	var turns []*genai.Content
-	for _, t := range readResp.GetTurns() {
-		turns = append(turns, SessionTurnToContent(t))
-	}
-	lastIdx := len(turns) - 1
-	lastHash := ""
-	if lastIdx >= 0 {
-		lastHash = ComputeTurnHash(turns[lastIdx])
+	// Seed the cursor at the newest turn. Without a baseline the channel reads as never
+	// synced, and the first sync pass would replay the agent's whole history into Discord.
+	var seedSeq int64
+	if seeded := SessionTurnsWithSeq(readResp.GetTurns()); len(seeded) > 0 {
+		seedSeq = seeded[len(seeded)-1].Seq
 	}
 
 	binding := &ChannelBinding{
-		ChannelID:     i.ChannelID,
-		GuildID:       i.GuildID,
-		AgentID:       agentID,
-		LastTurnIndex: lastIdx,
-		LastTurnHash:  lastHash,
-		WebhookID:     whID,
-		WebhookToken:  whToken,
+		ChannelID:    i.ChannelID,
+		GuildID:      i.GuildID,
+		AgentID:      agentID,
+		WebhookID:    whID,
+		WebhookToken: whToken,
+		LastSeq:      seedSeq,
 	}
 
 	syncUnlock := b.State.LockChannelSync(i.ChannelID)
@@ -316,11 +310,7 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
-	if b.Watcher != nil {
-		if err := b.Watcher.WatchAgent(agentID); err != nil {
-			log.Printf("⚠️ failed to watch agent %q for live session updates: %v", agentID, err)
-		}
-	}
+	b.feed.watch(agentID)
 
 	b.respondInteraction(s, i, fmt.Sprintf("✅ Channel bound to agent **%s** (model: `%s`)!\nMessages sent in this channel will drive this agent.", agentID, modelName), false)
 }
@@ -350,9 +340,7 @@ func (b *Bot) handleUnbindCommand(s *discordgo.Session, i *discordgo.Interaction
 		return
 	}
 
-	if b.Watcher != nil {
-		b.Watcher.UnwatchAgent(agentID)
-	}
+	b.feed.unwatch(agentID)
 
 	b.respondInteraction(s, i, fmt.Sprintf("🔓 Channel unbound from agent **%s**.", agentID), false)
 }
@@ -364,13 +352,13 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, i *discordgo.Interaction
 		return
 	}
 
-	insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID})
+	insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID})
 	if err != nil || insp == nil || !insp.GetAgentDirExists() {
 		b.respondInteraction(s, i, fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`.", binding.AgentID, b.WsDir), true)
 		return
 	}
 
-	memResp, memErr := b.SDK.ReadMemory(context.Background(), &agentv1.ReadMemoryRequest{AgentId: binding.AgentID})
+	memResp, memErr := b.Client.ReadMemory(context.Background(), &agentv1.ReadMemoryRequest{AgentId: binding.AgentID})
 	mem := ""
 	if memErr != nil {
 		mem = fmt.Sprintf("memory unavailable: %v", memErr)
@@ -388,13 +376,12 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, i *discordgo.Interaction
 	modelName := "default"
 	endpoint := "default"
 	if insp.GetRuntimeJsonValid() {
-		if cfg, err := agent.LoadRuntimeConfig(insp.GetAgentDir()); err == nil && cfg != nil {
-			if cfg.Model != "" {
-				modelName = cfg.Model
-			}
-			if cfg.Endpoint != "" {
-				endpoint = cfg.Endpoint
-			}
+		m, ep := runtimeSummary(insp.GetAgentDir())
+		if m != "" {
+			modelName = m
+		}
+		if ep != "" {
+			endpoint = ep
 		}
 	} else if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
 		modelName = fmt.Sprintf("error: %s", insp.GetRuntimeJsonError())
@@ -454,7 +441,7 @@ func (b *Bot) handleFillCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 	syncUnlock()
 
-	insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID})
+	insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID})
 	if err != nil || insp == nil || !insp.GetAgentDirExists() {
 		b.editInteractionResponse(s, i, fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`.", binding.AgentID, b.WsDir))
 		return
@@ -513,7 +500,7 @@ func (b *Bot) handleVerboseCommand(s *discordgo.Session, i *discordgo.Interactio
 }
 
 func (b *Bot) handleAgentsCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	resp, err := b.SDK.ListAgents(context.Background(), &agentv1.ListAgentsRequest{})
+	resp, err := b.Client.ListAgents(context.Background(), &agentv1.ListAgentsRequest{})
 	if err != nil {
 		b.respondInteraction(s, i, fmt.Sprintf("❌ Failed to list agents: %v", err), true)
 		return
@@ -528,7 +515,7 @@ func (b *Bot) handleAgentsCommand(s *discordgo.Session, i *discordgo.Interaction
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("📂 **Workspace Agents (%d found):**\n\n", len(ids)))
 	for _, id := range ids {
-		insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: id})
+		insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: id})
 		if err != nil || insp == nil {
 			sb.WriteString(fmt.Sprintf("• `%s` *(inspection error)*\n", id))
 			continue
@@ -537,8 +524,8 @@ func (b *Bot) handleAgentsCommand(s *discordgo.Session, i *discordgo.Interaction
 		modelName := "default"
 		if insp.GetRuntimeJsonValid() {
 			statusIcon = "🟢"
-			if cfg, err := agent.LoadRuntimeConfig(insp.GetAgentDir()); err == nil && cfg != nil && cfg.Model != "" {
-				modelName = cfg.Model
+			if m, _ := runtimeSummary(insp.GetAgentDir()); m != "" {
+				modelName = m
 			}
 		} else if insp.GetRuntimeJsonExists() {
 			statusIcon = "🟡"
@@ -569,7 +556,7 @@ func (b *Bot) handleStopCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
-	if _, err := b.SDK.CancelTurn(context.Background(), &agentv1.CancelTurnRequest{AgentId: binding.AgentID}); err != nil {
+	if _, err := b.Client.CancelTurn(context.Background(), &agentv1.CancelTurnRequest{AgentId: binding.AgentID}); err != nil {
 		b.respondInteraction(s, i, fmt.Sprintf("ℹ️ No in-flight turn for agent **%s**.", binding.AgentID), false)
 		return
 	}
@@ -660,7 +647,7 @@ func (b *Bot) handleAsideCommand(s *discordgo.Session, i *discordgo.InteractionC
 
 	// Resolved rather than called on the SDK directly, so a bridged agent gets the bridge's own
 	// answer - including its refusal - instead of a local agent nobody is talking to.
-	client, cleanup, err := agent.ResolveAgentClient(context.Background(), b.SDK, binding.AgentID)
+	client, cleanup, err := b.dispatch(binding.AgentID)
 	if err != nil {
 		b.editInteractionResponse(s, i, fmt.Sprintf("❌ Could not reach agent **%s**: %v", binding.AgentID, err))
 		return
@@ -794,7 +781,7 @@ func (b *Bot) handleAddCommand(s *discordgo.Session, i *discordgo.InteractionCre
 	// Resolved rather than called on the SDK directly, so a channel bound to a routed agent sends
 	// the append to the bridge that owns the session instead of writing into a local folder that
 	// nothing will ever read.
-	client, cleanup, err := agent.ResolveAgentClient(context.Background(), b.SDK, binding.AgentID)
+	client, cleanup, err := b.dispatch(binding.AgentID)
 	if err != nil {
 		b.respondInteraction(s, i, queueFailure(binding.AgentID, err), false)
 		return
@@ -875,7 +862,7 @@ func (b *Bot) handleCompactCommand(s *discordgo.Session, i *discordgo.Interactio
 
 	// Resolved rather than called on the SDK directly, so a channel bound to a routed agent
 	// sends compaction to the bridge that owns the session instead of hunting for a local one.
-	client, cleanup, err := agent.ResolveAgentClient(context.Background(), b.SDK, binding.AgentID)
+	client, cleanup, err := b.dispatch(binding.AgentID)
 	if err != nil {
 		b.editInteractionResponse(s, i, fmt.Sprintf("❌ Could not reach agent **%s**: %v", binding.AgentID, err))
 		return
@@ -908,7 +895,7 @@ func (b *Bot) handleCompactCommand(s *discordgo.Session, i *discordgo.Interactio
 // sessionContextSnapshot decorates a compaction reply with turn and token counts. Errors
 // become nil: the verdict comes from the RPC, these numbers only explain it.
 func (b *Bot) sessionContextSnapshot(agentID string) *agentv1.InspectSessionContextResponse {
-	resp, err := b.SDK.InspectSessionContext(context.Background(), &agentv1.InspectSessionContextRequest{
+	resp, err := b.Client.InspectSessionContext(context.Background(), &agentv1.InspectSessionContextRequest{
 		AgentId:      agentID,
 		WorkspaceDir: b.WsDir,
 	})
