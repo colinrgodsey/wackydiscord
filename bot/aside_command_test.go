@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/colinrgodsey/wackypub/pkg/agent"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -225,7 +224,7 @@ func TestAsideCommand_BridgedUnimplementedSurfacesBridgeMessage(t *testing.T) {
 func TestAsideCommand_RoutedAgentGoesToTheBridge(t *testing.T) {
 	b, spy, agentDir := setupCompactBot(t, `{"model":"test-model","endpoint":"http://127.0.0.1:1/v1","contextWindow":1000000}`)
 	seedSession(t, agentDir, 2)
-	_ = os.WriteFile(filepath.Join(b.WsDir, agent.RemoteManifestFile),
+	_ = os.WriteFile(filepath.Join(b.WsDir, RemoteManifestFile),
 		[]byte("bob: /nonexistent/bridge-binary --agent-folder="+agentDir+"\n"), 0644)
 
 	b.handleAsideCommand(b.Session, asideInteraction("anything the bridge knows"))

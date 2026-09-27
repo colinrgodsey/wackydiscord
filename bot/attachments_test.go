@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/colinrgodsey/wackypub/pkg/agent"
 )
 
 // TestAttachments_TextInliningWithDynamicFence verifies text attachment inlining and dynamic code fencing.
@@ -217,10 +216,10 @@ func TestAttachments_ProcessAttachments(t *testing.T) {
 		t.Fatalf("failed to write AGENTS.md: %v", err)
 	}
 
-	sdk := agent.NewSDK(tmpDir)
+	sdk := newFakeAgent(tmpDir)
 	b := &Bot{
-		WsDir: tmpDir,
-		SDK:   sdk,
+		WsDir:  tmpDir,
+		Client: sdk,
 	}
 
 	t.Run("text attachment inlining", func(t *testing.T) {
@@ -542,7 +541,7 @@ func TestHandleMessageCreate_WithAttachments(t *testing.T) {
 		t.Fatalf("failed to create bobDir: %v", err)
 	}
 	_ = os.WriteFile(filepath.Join(bobDir, "AGENTS.md"), []byte("Bob system prompt"), 0644)
-	_ = os.WriteFile(filepath.Join(bobDir, agent.AllowedAgentsFile), []byte("bob\n"), 0644)
+	_ = os.WriteFile(filepath.Join(bobDir, allowedAgentsFileName), []byte("bob\n"), 0644)
 
 	stateFile := filepath.Join(tmpDir, ".wackydiscord.json")
 	st, err := NewState(stateFile)
@@ -587,9 +586,9 @@ func TestHandleMessageCreate_WithAttachments(t *testing.T) {
 	defer os.Chdir(origCwd)
 
 	b := &Bot{
-		WsDir: tmpDir,
-		State: st,
-		SDK:   agent.NewSDK(tmpDir),
+		WsDir:  tmpDir,
+		State:  st,
+		Client: newFakeAgent(tmpDir),
 	}
 
 	s, err := discordgo.New("Bot fake-token")

@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/colinrgodsey/wackypub/pkg/agent"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 )
 
@@ -19,14 +18,19 @@ type Config struct {
 	StateFilePath string
 	GuildID       string // Optional: registers slash commands to a specific guild for instant availability
 	DefaultOpen   *bool  // Optional: override allowlist default policy when unclaimed
+	WackypubBin   string // Optional: path to the wackypub binary; defaults to "wackypub" on PATH
 }
 
 // Bot manages the Discord gateway session, channel bindings, and WackyPub agent integration.
 type Bot struct {
 	Session *discordgo.Session
-	SDK     *agent.AgentSDK
+	// Client is the protocol surface: every agent operation crosses the stdio boundary.
+	Client AgentClient
+	// server is the spawned wackypub backing Client. nil when Client was injected, which
+	// is how the tests drive the bot without a binary.
+	server  *SpawnedServer
+	feed    *sessionFeed
 	State   *State
-	Watcher *SessionWatcher
 	WsDir   string
 	GuildID string
 	AppID   string
@@ -48,10 +52,10 @@ func NewBot(cfg Config) (*Bot, error) {
 	}
 
 	// Verify workspace directory contains WACKYPUB_ROOT marker file
-	markerPath := filepath.Join(absWsDir, agent.RootMarkerFile)
+	markerPath := filepath.Join(absWsDir, RootMarkerFile)
 	if _, err := os.Stat(markerPath); err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("invalid workspace directory %q: missing %s marker file", absWsDir, agent.RootMarkerFile)
+			return nil, fmt.Errorf("invalid workspace directory %q: missing %s marker file", absWsDir, RootMarkerFile)
 		}
 		return nil, fmt.Errorf("failed to check workspace marker file in %q: %w", absWsDir, err)
 	}
@@ -67,8 +71,8 @@ func NewBot(cfg Config) (*Bot, error) {
 	// before any A2A call-chain machinery starts, and the bot is the only thing in this
 	// process. os.Unsetenv only errors on a malformed key, which these fixed constant names
 	// can never be, so the error is discarded rather than checked.
-	_ = os.Unsetenv(agent.Agent2AgentEnvVar)
-	_ = os.Unsetenv(agent.CallChainEnvVar)
+	_ = os.Unsetenv(EnvAgent2Agent)
+	_ = os.Unsetenv(EnvCallChain)
 
 	st, err := NewState(statePath)
 	if err != nil {
@@ -89,19 +93,20 @@ func NewBot(cfg Config) (*Bot, error) {
 		discordgo.IntentsMessageContent |
 		discordgo.IntentsGuilds
 
+	server, err := SpawnServer(context.Background(), cfg.WackypubBin, absWsDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start agent protocol server: %w", err)
+	}
+
 	b := &Bot{
 		Session: dg,
-		SDK:     agent.NewSDK(absWsDir),
+		Client:  server,
+		server:  server,
 		State:   st,
 		WsDir:   absWsDir,
 		GuildID: cfg.GuildID,
 	}
-
-	sw, err := NewSessionWatcher(b)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize session watcher: %w", err)
-	}
-	b.Watcher = sw
+	b.feed = newSessionFeed(b)
 
 	// Register event handlers
 	dg.AddHandler(b.handleReady)
@@ -136,7 +141,7 @@ func (b *Bot) ValidateBindings() []string {
 	var warnings []string
 	bindings := b.State.GetAllBindings()
 	for channelID, binding := range bindings {
-		insp, err := b.SDK.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID})
+		insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
 		if err != nil || insp == nil || !insp.GetAgentDirExists() {
 			warnings = append(warnings, fmt.Sprintf("channel %s is bound to missing agent %q in workspace %s", channelID, binding.AgentID, b.WsDir))
 		} else if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
@@ -153,10 +158,14 @@ func (b *Bot) Start(ctx context.Context) error {
 	}
 	defer b.Session.Close()
 
-	if b.Watcher != nil {
-		b.Watcher.Start(ctx)
-		defer b.Watcher.Close()
+	if b.feed != nil {
+		b.feed.start(ctx)
 	}
+	defer func() {
+		if err := b.server.Close(); err != nil {
+			log.Printf("⚠️ agent protocol server shutdown error: %v", err)
+		}
+	}()
 
 	log.Printf("🚀 WackyDiscord bot is running. Press Ctrl+C to exit.")
 	<-ctx.Done()

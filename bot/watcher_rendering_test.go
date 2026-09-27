@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/colinrgodsey/wackypub/pkg/agent"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 	"google.golang.org/genai"
 )
@@ -36,7 +35,7 @@ func setupTestBot(t *testing.T, agentID string) (*Bot, string, *State) {
 	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("Prompt for "+agentID), 0644); err != nil {
 		t.Fatalf("failed to write AGENTS.md: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(agentDir, agent.AllowedAgentsFile), []byte(agentID+"\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(agentDir, allowedAgentsFileName), []byte(agentID+"\n"), 0644); err != nil {
 		t.Fatalf("failed to write allowed agents: %v", err)
 	}
 
@@ -54,21 +53,16 @@ func setupTestBot(t *testing.T, agentID string) (*Bot, string, *State) {
 		_ = os.Chdir(origCwd)
 	})
 
-	sdk := agent.NewSDK(tmpDir)
+	sdk := newFakeAgent(tmpDir)
 	b := &Bot{
-		WsDir: tmpDir,
-		State: st,
-		SDK:   sdk,
+		WsDir:  tmpDir,
+		State:  st,
+		Client: sdk,
 	}
 
-	watcher, err := NewSessionWatcher(b)
-	if err != nil {
-		t.Fatalf("NewSessionWatcher failed: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = watcher.Close()
-	})
-	b.Watcher = watcher
+	feed := newSessionFeed(b)
+	t.Cleanup(feed.close)
+	b.feed = feed
 
 	return b, agentDir, st
 }
@@ -107,19 +101,16 @@ func TestWatcher_ToolExecutionDuringGenerationNotBackfilledWithoutDeadlock(t *te
 
 	// Initial user prompt that triggered the generation turn
 	initTurn := genai.NewContentFromText("Build the target", "user")
-	if err := agent.AppendSessionContent(agentDir, initTurn); err != nil {
+	if err := appendSessionContent(agentDir, initTurn); err != nil {
 		t.Fatalf("AppendSessionContent initTurn failed: %v", err)
 	}
-	initHash := ComputeTurnHash(initTurn)
 
 	channelID := "chan_tool_render"
 	binding := &ChannelBinding{
-		ChannelID:     channelID,
-		AgentID:       "builder",
-		Verbose:       true,
-		IsGenerating:  true, // Actively generating!
-		LastTurnIndex: 0,
-		LastTurnHash:  initHash,
+		ChannelID:    channelID,
+		AgentID:      "builder",
+		Verbose:      true,
+		IsGenerating: true, // Actively generating!
 	}
 	if err := st.SetBinding(binding); err != nil {
 		t.Fatalf("SetBinding failed: %v", err)
@@ -148,10 +139,10 @@ func TestWatcher_ToolExecutionDuringGenerationNotBackfilledWithoutDeadlock(t *te
 			},
 		},
 	}
-	if err := agent.AppendSessionContent(agentDir, callTurn); err != nil {
+	if err := appendSessionContent(agentDir, callTurn); err != nil {
 		t.Fatalf("AppendSessionContent callTurn failed: %v", err)
 	}
-	if err := agent.AppendSessionContent(agentDir, respTurn); err != nil {
+	if err := appendSessionContent(agentDir, respTurn); err != nil {
 		t.Fatalf("AppendSessionContent respTurn failed: %v", err)
 	}
 
@@ -182,8 +173,8 @@ func TestWatcher_ToolExecutionDuringGenerationNotBackfilledWithoutDeadlock(t *te
 
 	// Verify sync markers were committed
 	finalBnd := st.GetBinding(channelID)
-	if finalBnd == nil || finalBnd.LastTurnIndex != 2 {
-		t.Errorf("expected LastTurnIndex to be updated to 2, got %+v", finalBnd)
+	if finalBnd == nil || finalBnd.LastSeq != 3 {
+		t.Errorf("expected LastSeq to be updated to 3, got %+v", finalBnd)
 	}
 }
 
@@ -198,9 +189,8 @@ func TestWatcher_UserMessageNotEchoedBack_AtomicRegistration(t *testing.T) {
 
 	channelID := "chan_echo_test"
 	binding := &ChannelBinding{
-		ChannelID:     channelID,
-		AgentID:       "echo_test_agent",
-		LastTurnIndex: -1,
+		ChannelID: channelID,
+		AgentID:   "echo_test_agent",
 	}
 	if err := st.SetBinding(binding); err != nil {
 		t.Fatalf("SetBinding failed: %v", err)
@@ -221,7 +211,7 @@ func TestWatcher_UserMessageNotEchoedBack_AtomicRegistration(t *testing.T) {
 		bnd.IsGenerating = true
 		_ = st.SetBinding(bnd)
 
-		res, err := b.SDK.AddUserTurn(context.Background(), &agentv1.AddUserTurnRequest{
+		res, err := b.Client.AddUserTurn(context.Background(), &agentv1.AddUserTurnRequest{
 			AgentId: bnd.AgentID,
 			Message: userMsgText,
 		})
@@ -259,8 +249,8 @@ func TestWatcher_UserMessageNotEchoedBack_AtomicRegistration(t *testing.T) {
 	if len(bnd.PendingUserHashes) != 0 {
 		t.Errorf("expected PendingUserHashes to be consumed, got: %v", bnd.PendingUserHashes)
 	}
-	if bnd.LastTurnIndex != 0 {
-		t.Errorf("expected LastTurnIndex to be updated to 0, got %d", bnd.LastTurnIndex)
+	if bnd.LastSeq != 1 {
+		t.Errorf("expected LastSeq to be updated to 1, got %d", bnd.LastSeq)
 	}
 	_ = agentDir
 }
@@ -275,17 +265,15 @@ func TestWatcher_FlushNowFlushesPendingTurnsImmediately(t *testing.T) {
 	b.Session = s
 
 	initTurn := genai.NewContentFromText("User prompt", "user")
-	if err := agent.AppendSessionContent(agentDir, initTurn); err != nil {
+	if err := appendSessionContent(agentDir, initTurn); err != nil {
 		t.Fatalf("AppendSessionContent initTurn failed: %v", err)
 	}
-	initHash := ComputeTurnHash(initTurn)
 
 	channelID := "chan_flush"
 	binding := &ChannelBinding{
-		ChannelID:     channelID,
-		AgentID:       "flush_agent",
-		LastTurnIndex: 0,
-		LastTurnHash:  initHash,
+		ChannelID: channelID,
+		AgentID:   "flush_agent",
+		LastSeq:   1,
 	}
 	if err := st.SetBinding(binding); err != nil {
 		t.Fatalf("SetBinding failed: %v", err)
@@ -293,16 +281,13 @@ func TestWatcher_FlushNowFlushesPendingTurnsImmediately(t *testing.T) {
 
 	// Append a model turn
 	modelTurn := genai.NewContentFromText("Mission accomplished immediately.", "model")
-	if err := agent.AppendSessionContent(agentDir, modelTurn); err != nil {
+	if err := appendSessionContent(agentDir, modelTurn); err != nil {
 		t.Fatalf("AppendSessionContent failed: %v", err)
 	}
 
-	// Start debounce timers
-	b.Watcher.debounceAgentSync("flush_agent")
-
 	// Call FlushNow synchronously
 	start := time.Now()
-	b.Watcher.FlushNow("flush_agent")
+	b.feed.flushNow("flush_agent")
 	elapsed := time.Since(start)
 
 	// Verify FlushNow executed immediately (well under the 400ms debounce timer)
@@ -327,8 +312,8 @@ func TestWatcher_FlushNowFlushesPendingTurnsImmediately(t *testing.T) {
 
 	// Verify sync marker was committed
 	finalBnd := st.GetBinding(channelID)
-	if finalBnd == nil || finalBnd.LastTurnIndex != 1 {
-		t.Errorf("expected LastTurnIndex to be 1, got %+v", finalBnd)
+	if finalBnd == nil || finalBnd.LastSeq != 2 {
+		t.Errorf("expected LastSeq to be 2, got %+v", finalBnd)
 	}
 	time.Sleep(20 * time.Millisecond)
 }
@@ -396,18 +381,16 @@ func TestWatcher_ToolTurnsSyncWithoutToolBackfill(t *testing.T) {
 	b.Session = s
 
 	initTurn := genai.NewContentFromText("Batch user prompt", "user")
-	if err := agent.AppendSessionContent(agentDir, initTurn); err != nil {
+	if err := appendSessionContent(agentDir, initTurn); err != nil {
 		t.Fatalf("AppendSessionContent initTurn failed: %v", err)
 	}
-	initHash := ComputeTurnHash(initTurn)
 
 	channelID := "chan_batch"
 	_ = st.SetBinding(&ChannelBinding{
-		ChannelID:     channelID,
-		AgentID:       "batch_agent",
-		Verbose:       true,
-		LastTurnIndex: 0,
-		LastTurnHash:  initHash,
+		ChannelID: channelID,
+		AgentID:   "batch_agent",
+		Verbose:   true,
+		LastSeq:   1,
 	})
 
 	// Append 3 contiguous tool calls and 3 tool outputs
@@ -434,12 +417,12 @@ func TestWatcher_ToolTurnsSyncWithoutToolBackfill(t *testing.T) {
 				},
 			},
 		}
-		_ = agent.AppendSessionContent(agentDir, call)
-		_ = agent.AppendSessionContent(agentDir, resp)
+		_ = appendSessionContent(agentDir, call)
+		_ = appendSessionContent(agentDir, resp)
 	}
 
 	// Add final assistant text turn
-	_ = agent.AppendSessionContent(agentDir, genai.NewContentFromText("All tools finished.", "model"))
+	_ = appendSessionContent(agentDir, genai.NewContentFromText("All tools finished.", "model"))
 
 	// Sync turns
 	count, err := b.autoFillUnsyncedTurns(s, nil, channelID, 0)
@@ -480,18 +463,16 @@ func TestWatcher_SyntheticContinuationTurns(t *testing.T) {
 	b.Session = s
 
 	initTurn := genai.NewContentFromText("Initial task prompt", "user")
-	if err := agent.AppendSessionContent(agentDir, initTurn); err != nil {
+	if err := appendSessionContent(agentDir, initTurn); err != nil {
 		t.Fatalf("AppendSessionContent initTurn failed: %v", err)
 	}
-	initHash := ComputeTurnHash(initTurn)
 
 	channelID := "chan_continuation"
 	_ = st.SetBinding(&ChannelBinding{
-		ChannelID:     channelID,
-		AgentID:       "continuation_agent",
-		Verbose:       true,
-		LastTurnIndex: 0,
-		LastTurnHash:  initHash,
+		ChannelID: channelID,
+		AgentID:   "continuation_agent",
+		Verbose:   true,
+		LastSeq:   1,
 	})
 
 	// Inject synthetic continuation user turn
@@ -499,7 +480,7 @@ func TestWatcher_SyntheticContinuationTurns(t *testing.T) {
 		`<CONTINUATION reason="post-compaction">Session context was compacted. Resume your task.</CONTINUATION>`,
 		"user",
 	)
-	_ = agent.AppendSessionContent(agentDir, continuationTurn)
+	_ = appendSessionContent(agentDir, continuationTurn)
 
 	// Sync turns
 	count, err := b.autoFillUnsyncedTurns(s, nil, channelID, 0)
@@ -560,28 +541,26 @@ func TestWatcher_ConcurrentSyncDoesNotEchoOrDoubleRender(t *testing.T) {
 
 	channelID := "chan_concurrent"
 	initTurn := genai.NewContentFromText("System init", "user")
-	if err := agent.AppendSessionContent(agentDir, initTurn); err != nil {
+	if err := appendSessionContent(agentDir, initTurn); err != nil {
 		t.Fatalf("AppendSessionContent initTurn failed: %v", err)
 	}
-	initHash := ComputeTurnHash(initTurn)
 
 	userMsgText := "Calculate the warp trajectory."
 	userTurn := genai.NewContentFromText(userMsgText, "user")
-	if err := agent.AppendSessionContent(agentDir, userTurn); err != nil {
+	if err := appendSessionContent(agentDir, userTurn); err != nil {
 		t.Fatalf("AppendSessionContent userTurn failed: %v", err)
 	}
 	userHash := ComputeTurnHash(userTurn)
 
 	modelTurn := genai.NewContentFromText("Trajectory calculated.", "model")
-	if err := agent.AppendSessionContent(agentDir, modelTurn); err != nil {
+	if err := appendSessionContent(agentDir, modelTurn); err != nil {
 		t.Fatalf("AppendSessionContent modelTurn failed: %v", err)
 	}
 
 	binding := &ChannelBinding{
-		ChannelID:     channelID,
-		AgentID:       "concurrent_agent",
-		LastTurnIndex: 0,
-		LastTurnHash:  initHash,
+		ChannelID: channelID,
+		AgentID:   "concurrent_agent",
+		LastSeq:   1,
 	}
 	binding.AddPendingUserHash(userHash)
 	if err := st.SetBinding(binding); err != nil {
@@ -658,17 +637,15 @@ func TestWatcher_UserOnlyTurnDeferredWhileGenerating(t *testing.T) {
 	// with no history takes DiffUnsyncedTurns Case 1 which records markers but never
 	// surfaces unsynced content, so the deferred-tail guard would not be exercised.
 	priorTurn := genai.NewContentFromText("System init", "user")
-	if err := agent.AppendSessionContent(agentDir, priorTurn); err != nil {
+	if err := appendSessionContent(agentDir, priorTurn); err != nil {
 		t.Fatalf("AppendSessionContent priorTurn failed: %v", err)
 	}
-	priorHash := ComputeTurnHash(priorTurn)
 
 	binding := &ChannelBinding{
-		ChannelID:     channelID,
-		AgentID:       "echo_guard_agent",
-		LastTurnIndex: 0,
-		LastTurnHash:  priorHash,
-		IsGenerating:  true, // The turn is mid-generation; the watcher must not echo the user turn.
+		ChannelID:    channelID,
+		AgentID:      "echo_guard_agent",
+		IsGenerating: true, // The turn is mid-generation; the watcher must not echo the user turn.
+		LastSeq:      1,
 	}
 	if err := st.SetBinding(binding); err != nil {
 		t.Fatalf("SetBinding failed: %v", err)
@@ -676,7 +653,7 @@ func TestWatcher_UserOnlyTurnDeferredWhileGenerating(t *testing.T) {
 
 	userMsgText := "Merge the wackyacp PR please."
 	userTurn := genai.NewContentFromText(userMsgText, "user")
-	if err := agent.AppendSessionContent(agentDir, userTurn); err != nil {
+	if err := appendSessionContent(agentDir, userTurn); err != nil {
 		t.Fatalf("AppendSessionContent userTurn failed: %v", err)
 	}
 
@@ -698,8 +675,8 @@ func TestWatcher_UserOnlyTurnDeferredWhileGenerating(t *testing.T) {
 	if bnd == nil {
 		t.Fatal("binding missing after sync")
 	}
-	if bnd.LastTurnIndex != 0 {
-		t.Fatalf("watermark advanced to %d while the user turn was deferred, want 0 (prior turn)", bnd.LastTurnIndex)
+	if bnd.LastSeq != 1 {
+		t.Fatalf("watermark advanced to %d while the user turn was deferred, want 1 (prior turn)", bnd.LastSeq)
 	}
 
 	// The handler's post-AddUserTurn registration lands (it closed the race window right
@@ -714,7 +691,7 @@ func TestWatcher_UserOnlyTurnDeferredWhileGenerating(t *testing.T) {
 
 	// Now the assistant response arrives; IsGenerating clears.
 	modelTurn := genai.NewContentFromText("Merged. sha 1234abc.", "model")
-	if err := agent.AppendSessionContent(agentDir, modelTurn); err != nil {
+	if err := appendSessionContent(agentDir, modelTurn); err != nil {
 		t.Fatalf("AppendSessionContent modelTurn failed: %v", err)
 	}
 	fresh = st.GetBinding(channelID)
@@ -749,8 +726,8 @@ func TestWatcher_UserOnlyTurnDeferredWhileGenerating(t *testing.T) {
 	if bnd == nil {
 		t.Fatal("binding missing after second sync")
 	}
-	if bnd.LastTurnIndex != 2 {
-		t.Fatalf("watermark = %d after paired render, want 2", bnd.LastTurnIndex)
+	if bnd.LastSeq != 3 {
+		t.Fatalf("watermark = %d after paired render, want 3", bnd.LastSeq)
 	}
 }
 
@@ -774,17 +751,15 @@ func TestWatcher_OrphanedUserTurnRendersAfterGenerationSettles(t *testing.T) {
 	// take DiffUnsyncedTurns Case 1 and never surface anything, which would not exercise
 	// the guard or the orphan decision).
 	priorTurn := genai.NewContentFromText("System init", "user")
-	if err := agent.AppendSessionContent(agentDir, priorTurn); err != nil {
+	if err := appendSessionContent(agentDir, priorTurn); err != nil {
 		t.Fatalf("AppendSessionContent priorTurn failed: %v", err)
 	}
-	priorHash := ComputeTurnHash(priorTurn)
 
 	binding := &ChannelBinding{
-		ChannelID:     channelID,
-		AgentID:       "orphan_agent",
-		LastTurnIndex: 0,
-		LastTurnHash:  priorHash,
-		IsGenerating:  false, // generation confirmed absent; this turn is a genuine orphan
+		ChannelID:    channelID,
+		AgentID:      "orphan_agent",
+		IsGenerating: false, // generation confirmed absent; this turn is a genuine orphan
+		LastSeq:      1,
 	}
 	if err := st.SetBinding(binding); err != nil {
 		t.Fatalf("SetBinding failed: %v", err)
@@ -792,7 +767,7 @@ func TestWatcher_OrphanedUserTurnRendersAfterGenerationSettles(t *testing.T) {
 
 	userMsgText := "unpaired user text"
 	userTurn := genai.NewContentFromText(userMsgText, "user")
-	if err := agent.AppendSessionContent(agentDir, userTurn); err != nil {
+	if err := appendSessionContent(agentDir, userTurn); err != nil {
 		t.Fatalf("AppendSessionContent userTurn failed: %v", err)
 	}
 
@@ -816,7 +791,7 @@ func TestWatcher_OrphanedUserTurnRendersAfterGenerationSettles(t *testing.T) {
 	if bnd == nil {
 		t.Fatal("binding missing after sync")
 	}
-	if bnd.LastTurnIndex != 1 {
-		t.Fatalf("watermark = %d after orphan backfill, want 1", bnd.LastTurnIndex)
+	if bnd.LastSeq != 2 {
+		t.Fatalf("watermark = %d after orphan backfill, want 2", bnd.LastSeq)
 	}
 }

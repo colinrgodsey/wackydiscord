@@ -13,7 +13,6 @@ import (
 	"unicode"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/colinrgodsey/wackypub/pkg/agent"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 )
 
@@ -223,9 +222,10 @@ func (b *Bot) ProcessAttachments(ctx context.Context, agentID string, attachment
 
 		if isImageAttachment(att) {
 			if len(data) > 0 {
-				if _, addErr := b.SDK.AddMedia(budgetCtx, &agentv1.AddMediaRequest{
-					AgentId:   agentID,
-					MediaData: data,
+				if _, addErr := b.Client.AddMedia(budgetCtx, &agentv1.AddMediaRequest{
+					AgentId:      agentID,
+					MediaData:    data,
+					WorkspaceDir: b.WsDir,
 				}); addErr == nil {
 					result.ImagesDownloaded++
 				} else {
@@ -240,7 +240,6 @@ func (b *Bot) ProcessAttachments(ctx context.Context, agentID string, attachment
 			sections = append(sections, inlined)
 		} else {
 			// Binary or large file (>100KB) -> Scratchpad
-			agentDir := b.SDK.AgentDir(agentID)
 			createdBy := SanitizeCreatedBy("discord_att")
 			mimeType := att.ContentType
 			if mimeType == "" {
@@ -250,13 +249,19 @@ func (b *Bot) ProcessAttachments(ctx context.Context, agentID string, attachment
 				}
 				mimeType = http.DetectContentType(prefix)
 			}
-			entry, spErr := agent.CreateBinaryScratchpad(agentDir, data, createdBy, mimeType)
+			spResp, spErr := b.Client.CreateScratchpad(budgetCtx, &agentv1.CreateScratchpadRequest{
+				AgentId:      agentID,
+				CreatedBy:    createdBy,
+				WorkspaceDir: b.WsDir,
+				Data:         data,
+				MimeType:     mimeType,
+			})
 			if spErr != nil {
-				log.Printf("⚠️ CreateBinaryScratchpad failed for %s: %v", sanitizedName, spErr)
+				log.Printf("⚠️ scratchpad create failed for %s: %v", sanitizedName, spErr)
 				sections = append(sections, fmt.Sprintf("[Attached file: %s skipped: failed to save to scratchpad: %v]", sanitizedName, spErr))
 			} else {
 				ref := fmt.Sprintf("[Attached file: %s (saved to scratchpad entry '%s', %d bytes). Use scratchpad tools to inspect.]",
-					sanitizedName, entry.ID, len(data))
+					sanitizedName, spResp.GetEntry().GetEntryId(), len(data))
 				sections = append(sections, ref)
 			}
 		}

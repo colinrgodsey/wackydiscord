@@ -26,13 +26,17 @@ const (
 
 // ChannelBinding records the association between a Discord channel and a WackyPub agent.
 type ChannelBinding struct {
-	ChannelID         string   `json:"channel_id"`
-	AgentID           string   `json:"agent_id"`
-	GuildID           string   `json:"guild_id,omitempty"`
-	Verbose           bool     `json:"verbose"`
-	IsGenerating      bool     `json:"is_generating,omitempty"`
-	LastTurnHash      string   `json:"last_turn_hash,omitempty"`
-	LastTurnIndex     int      `json:"last_turn_index"`
+	ChannelID    string `json:"channel_id"`
+	AgentID      string `json:"agent_id"`
+	GuildID      string `json:"guild_id,omitempty"`
+	Verbose      bool   `json:"verbose"`
+	IsGenerating bool   `json:"is_generating,omitempty"`
+	// LastSeq is the sync cursor: the seq of the newest session turn already rendered into
+	// this channel. It replaces the previous content-hash plus index pair, which had to be
+	// re-derived every pass and could silently vanish when compaction rewrote the prefix. A
+	// seq survives compaction, and a gap in it is detectable instead of inferred.
+	// Zero means "no cursor yet", which the cold-start rule in adoptSeqCursor resolves.
+	LastSeq           int64    `json:"last_seq,omitempty"`
 	PendingUserHashes []string `json:"pending_user_hashes,omitempty"`
 	WebhookID         string   `json:"webhook_id,omitempty"`
 	WebhookToken      string   `json:"webhook_token,omitempty"`

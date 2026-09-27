@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/colinrgodsey/wackypub/pkg/agent"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -41,7 +40,7 @@ func addInteractionOptions(opts []*discordgo.ApplicationCommandInteractionDataOp
 
 func sessionRoles(t *testing.T, agentDir string) []string {
 	t.Helper()
-	turns, err := agent.ReadSessionTurns(agentDir)
+	turns, err := readSessionTurns(agentDir)
 	if err != nil {
 		t.Fatalf("ReadSessionTurns: %v", err)
 	}
@@ -108,11 +107,11 @@ func TestAddCommand_QueuesTurnWithoutGenerating(t *testing.T) {
 	}
 
 	// The text must arrive verbatim, or the operator is guessing at what was stored.
-	turns, err := agent.ReadSessionTurns(agentDir)
+	turns, err := readSessionTurns(agentDir)
 	if err != nil {
 		t.Fatalf("ReadSessionTurns: %v", err)
 	}
-	if got := agent.ContentText(turns[4]); !strings.Contains(got, "the staging key rotated this morning") {
+	if got := contentText(turns[4]); !strings.Contains(got, "the staging key rotated this morning") {
 		t.Errorf("queued turn text is %q", got)
 	}
 }
@@ -214,7 +213,7 @@ func TestSlashGate_AddBlockedForNonOwner(t *testing.T) {
 func TestAddCommand_RoutedAgentGoesToTheBridge(t *testing.T) {
 	b, spy, agentDir := setupCompactBot(t, "")
 	seedSession(t, agentDir, 2)
-	_ = os.WriteFile(filepath.Join(b.WsDir, agent.RemoteManifestFile),
+	_ = os.WriteFile(filepath.Join(b.WsDir, RemoteManifestFile),
 		[]byte("bob: /nonexistent/bridge-binary --agent-folder="+agentDir+"\n"), 0644)
 
 	b.handleAddCommand(b.Session, addInteraction("anything the bridge knows"))
@@ -298,13 +297,12 @@ func TestAddCommand_WatcherBackfillsAddedTurnWithoutGenerating(t *testing.T) {
 	b, spy, agentDir := setupCompactBot(t, runtimeJSON(srv.URL))
 	seedSession(t, agentDir, 1)
 	// Watermark the seeded conversation, so the only unsynced turn is the one /add appends.
-	turns, err := agent.ReadSessionTurns(agentDir)
-	if err != nil {
-		t.Fatalf("ReadSessionTurns: %v", err)
-	}
 	binding := b.State.GetBinding("chan_compact")
-	binding.LastTurnIndex = len(turns) - 1
-	binding.LastTurnHash = ComputeTurnHash(turns[len(turns)-1])
+	seeded, err := readSessionTurnsFixture(agentDir)
+	if err != nil || len(seeded) == 0 {
+		t.Fatalf("reading seeded turns: %v", err)
+	}
+	binding.LastSeq = seeded[len(seeded)-1].Seq
 	if err := b.State.SetBinding(binding); err != nil {
 		t.Fatalf("SetBinding: %v", err)
 	}

@@ -13,7 +13,6 @@ import (
 	"testing"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/colinrgodsey/wackypub/pkg/agent"
 	"google.golang.org/genai"
 )
 
@@ -43,7 +42,7 @@ func setupCompactBot(t *testing.T, runtimeJSON string) (*Bot, *compactSpy, strin
 	}
 	ws := t.TempDir()
 	_ = os.WriteFile(filepath.Join(ws, "WACKYPUB_ROOT"), []byte(""), 0644)
-	_ = os.WriteFile(filepath.Join(ws, agent.AllowedAgentsFile), []byte("bob\n"), 0644)
+	_ = os.WriteFile(filepath.Join(ws, allowedAgentsFileName), []byte("bob\n"), 0644)
 
 	// The A2A authorization check walks up from the process working directory, so leaving it
 	// wherever go test started would pass or fail on whichever WACKYPUB_ROOT or
@@ -105,7 +104,7 @@ func setupCompactBot(t *testing.T, runtimeJSON string) (*Bot, *compactSpy, strin
 		}, nil
 	})
 
-	b := &Bot{WsDir: ws, State: st, SDK: agent.NewSDK(ws), Session: s}
+	b := &Bot{WsDir: ws, State: st, Client: newFakeAgent(ws), Session: s}
 	if err := b.State.SetBinding(&ChannelBinding{ChannelID: "chan_compact", AgentID: "bob"}); err != nil {
 		t.Fatalf("SetBinding: %v", err)
 	}
@@ -154,14 +153,14 @@ func seedSession(t *testing.T, agentDir string, n int) {
 			genai.NewContentFromText(fmt.Sprintf("model turn %d answering about that same thing", i), "model"),
 		)
 	}
-	if err := agent.WriteSessionTurns(agentDir, turns); err != nil {
+	if err := writeSessionTurns(agentDir, turns); err != nil {
 		t.Fatalf("WriteSessionTurns: %v", err)
 	}
 }
 
 func sessionTurnCount(t *testing.T, agentDir string) int {
 	t.Helper()
-	turns, err := agent.ReadSessionTurns(agentDir)
+	turns, err := readSessionTurns(agentDir)
 	if err != nil {
 		t.Fatalf("ReadSessionTurns: %v", err)
 	}
@@ -320,7 +319,7 @@ func TestCompactCommand_ForceOptionOfWrongTypeIsIgnored(t *testing.T) {
 func TestCompactCommand_RoutedAgentAsksTheBridge(t *testing.T) {
 	b, spy, agentDir := setupCompactBot(t, `{"model":"test-model","endpoint":"http://127.0.0.1:1/v1","contextWindow":1000000}`)
 	seedSession(t, agentDir, 2)
-	_ = os.WriteFile(filepath.Join(b.WsDir, agent.RemoteManifestFile),
+	_ = os.WriteFile(filepath.Join(b.WsDir, RemoteManifestFile),
 		[]byte("bob: /nonexistent/bridge-binary --agent-folder="+agentDir+"\n"), 0644)
 
 	b.handleCompactCommand(b.Session, compactInteraction(false))
