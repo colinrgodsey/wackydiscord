@@ -1495,3 +1495,45 @@ func TestSessionTurnsWithSeqDropsLegacyUnnumberedTurns(t *testing.T) {
 		t.Errorf("legacy-only session must hold the cursor empty: unsynced=%d newest=%d gap=%d", len(u), n, g)
 	}
 }
+
+func TestSessionTurnToContent_ThoughtPreservedAndFiltered(t *testing.T) {
+	protoTurn := &agentv1.SessionTurn{
+		Role: "model",
+		Parts: []*agentv1.SessionPart{
+			{Text: "Thinking block: internal deliberation", Thought: true},
+			{Text: "Rendered answer to user.", Thought: false},
+		},
+	}
+
+	content := SessionTurnToContent(protoTurn)
+	if content == nil {
+		t.Fatal("expected non-nil content")
+	}
+	if len(content.Parts) != 2 {
+		t.Fatalf("expected 2 parts, got %d", len(content.Parts))
+	}
+	if !content.Parts[0].Thought {
+		t.Errorf("expected part 0 Thought=true, got false")
+	}
+	if content.Parts[0].Text != "Thinking block: internal deliberation" {
+		t.Errorf("part 0 text mismatch: %q", content.Parts[0].Text)
+	}
+	if content.Parts[1].Thought {
+		t.Errorf("expected part 1 Thought=false, got true")
+	}
+	if content.Parts[1].Text != "Rendered answer to user." {
+		t.Errorf("part 1 text mismatch: %q", content.Parts[1].Text)
+	}
+
+	// Render path 1: FormatAssistantBackfillMessage drops thought parts
+	formatted := FormatAssistantBackfillMessage(content)
+	if formatted != "Rendered answer to user." {
+		t.Errorf("FormatAssistantBackfillMessage leaked thought or corrupted output: got %q, want %q", formatted, "Rendered answer to user.")
+	}
+
+	// Render path 2: contentText (!p.Thought at sync.go:118) drops thought parts
+	filteredText := contentText(content)
+	if filteredText != "Rendered answer to user." {
+		t.Errorf("contentText leaked thought or corrupted output: got %q, want %q", filteredText, "Rendered answer to user.")
+	}
+}

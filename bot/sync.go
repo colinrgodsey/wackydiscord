@@ -26,7 +26,8 @@ func SessionTurnToContent(st *agentv1.SessionTurn) *genai.Content {
 			continue
 		}
 		part := &genai.Part{
-			Text: p.Text,
+			Text:    p.Text,
+			Thought: p.GetThought(),
 		}
 		if len(p.InlineData) > 0 || p.MimeType != "" {
 			part.InlineData = &genai.Blob{
