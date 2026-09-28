@@ -64,10 +64,16 @@ func (b *Bot) resolveMessageContext(s *discordgo.Session, channelID string) (*Ch
 		return nil, false
 	}
 
-	// Verify bound agent exists and has valid configuration
-	insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
-	if err != nil || insp == nil || !insp.GetAgentDirExists() {
+	// Verify bound agent exists and has valid configuration. Absent and unreachable are
+	// separate answers: only a service that replied "no such agent folder" may say so.
+	presence, insp, err := b.classifyAgentWithRetry(context.Background(), binding.AgentID)
+	switch presence {
+	case agentAbsent:
 		b.say(s, channelID, "System", fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`. Use `/bind <agent_id>` to connect a valid agent.", binding.AgentID, b.WsDir), nil)
+		return nil, false
+	case agentServiceUnreachable:
+		log.Printf("⚠️ cannot verify binding for channel %s (agent %q): agent service did not answer: %v", channelID, binding.AgentID, err)
+		b.say(s, channelID, "System", fmt.Sprintf("⏳ **Not ready:** the agent service is not answering yet, so the binding for **%s** could not be verified. This is not a problem with the binding - try again in a moment.", binding.AgentID), nil)
 		return nil, false
 	}
 	if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {

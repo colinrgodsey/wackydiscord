@@ -161,6 +161,10 @@ type fakeAgent struct {
 	compactCalls int
 	scratchpads  map[string]string
 	nextEntry    int
+	// inspectErrs and listErrs are consumed in order, so a test can make the service answer
+	// only after a few refusals, which is the shape of a child that is still starting.
+	inspectErrs []error
+	listErrs    []error
 
 	cancelCalls int
 	inFlight    bool
@@ -181,6 +185,9 @@ func newFakeAgent(wsDir string) *fakeAgent {
 var _ AgentClient = (*fakeAgent)(nil)
 
 func (f *fakeAgent) InspectAgent(_ context.Context, in *agentv1.InspectAgentRequest, _ ...grpc.CallOption) (*agentv1.InspectAgentResponse, error) {
+	if err := f.takeInspectErr(); err != nil {
+		return nil, err
+	}
 	dir := agentDirIn(f.wsDir, in.GetAgentId())
 	resp := &agentv1.InspectAgentResponse{AgentId: in.GetAgentId(), AgentDir: dir}
 	if st, err := os.Stat(dir); err == nil && st.IsDir() {
@@ -194,7 +201,34 @@ func (f *fakeAgent) InspectAgent(_ context.Context, in *agentv1.InspectAgentRequ
 	return resp, nil
 }
 
+// takeInspectErr pops the next scripted inspection failure, if any.
+func (f *fakeAgent) takeInspectErr() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.inspectErrs) == 0 {
+		return nil
+	}
+	err := f.inspectErrs[0]
+	f.inspectErrs = f.inspectErrs[1:]
+	return err
+}
+
+// queueInspectFailures scripts the first n inspection failures.
+func (f *fakeAgent) queueInspectFailures(errs ...error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.inspectErrs = append(f.inspectErrs, errs...)
+}
+
 func (f *fakeAgent) ListAgents(_ context.Context, _ *agentv1.ListAgentsRequest, _ ...grpc.CallOption) (*agentv1.ListAgentsResponse, error) {
+	f.mu.Lock()
+	if len(f.listErrs) > 0 {
+		err := f.listErrs[0]
+		f.listErrs = f.listErrs[1:]
+		f.mu.Unlock()
+		return nil, err
+	}
+	f.mu.Unlock()
 	ents, err := os.ReadDir(f.wsDir)
 	if err != nil {
 		return nil, err

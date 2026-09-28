@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 
 	"github.com/bwmarrin/discordgo"
-	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 )
 
 // Config defines the runtime configuration options for the WackyDiscord bot.
@@ -98,6 +97,13 @@ func NewBot(cfg Config) (*Bot, error) {
 		return nil, fmt.Errorf("failed to start agent protocol server: %w", err)
 	}
 
+	// The gRPC client is lazy, so a spawned child is not yet known to be serving. Poll once so
+	// the restart window is closed before Discord traffic arrives; starting anyway is deliberate
+	// because the message path retries and reports readiness rather than blaming bindings.
+	if err := awaitAgentService(context.Background(), server, absWsDir, agentReadinessTimeout, agentReadinessPollEvery); err != nil {
+		warnIfServiceUnreachable(err, absWsDir)
+	}
+
 	b := &Bot{
 		Session: dg,
 		Client:  server,
@@ -141,10 +147,16 @@ func (b *Bot) ValidateBindings() []string {
 	var warnings []string
 	bindings := b.State.GetAllBindings()
 	for channelID, binding := range bindings {
-		insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
-		if err != nil || insp == nil || !insp.GetAgentDirExists() {
+		presence, insp, err := b.classifyAgent(context.Background(), binding.AgentID)
+		switch presence {
+		case agentAbsent:
 			warnings = append(warnings, fmt.Sprintf("channel %s is bound to missing agent %q in workspace %s", channelID, binding.AgentID, b.WsDir))
-		} else if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
+			continue
+		case agentServiceUnreachable:
+			warnings = append(warnings, fmt.Sprintf("channel %s is bound to agent %q but the agent service did not answer, so its binding was not verified: %v", channelID, binding.AgentID, err))
+			continue
+		}
+		if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
 			warnings = append(warnings, fmt.Sprintf("channel %s is bound to agent %q with invalid runtime.json: %s", channelID, binding.AgentID, insp.GetRuntimeJsonError()))
 		}
 	}
