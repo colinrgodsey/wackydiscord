@@ -14,9 +14,18 @@ import (
 )
 
 // SessionTurnToContent converts a proto SessionTurn into a *genai.Content struct.
+// In v1.1+, if ContentJson is populated, it unmarshals directly into genai.Content,
+// preserving thought flags, function calls, and inline data faithfully.
+// Otherwise, it falls back to converting legacy SessionParts.
 func SessionTurnToContent(st *agentv1.SessionTurn) *genai.Content {
 	if st == nil {
 		return nil
+	}
+	if jsonStr := st.GetContentJson(); jsonStr != "" {
+		var c genai.Content
+		if err := json.Unmarshal([]byte(jsonStr), &c); err == nil {
+			return &c
+		}
 	}
 	c := &genai.Content{
 		Role: st.Role,
