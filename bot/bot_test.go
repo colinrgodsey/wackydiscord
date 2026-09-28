@@ -1495,3 +1495,78 @@ func TestSessionTurnsWithSeqDropsLegacyUnnumberedTurns(t *testing.T) {
 		t.Errorf("legacy-only session must hold the cursor empty: unsynced=%d newest=%d gap=%d", len(u), n, g)
 	}
 }
+
+func TestSessionTurnToContent_ContentJSONFaithfulRoundTrip(t *testing.T) {
+	origContent := &genai.Content{
+		Role: "model",
+		Parts: []*genai.Part{
+			{Text: "Internal deliberation", Thought: true},
+			{FunctionCall: &genai.FunctionCall{Name: "bash", ID: "call_456"}},
+			{Text: "Clean answer for Discord."},
+		},
+	}
+	rawJSON, err := json.Marshal(origContent)
+	if err != nil {
+		t.Fatalf("marshal origContent: %v", err)
+	}
+
+	protoTurn := &agentv1.SessionTurn{
+		Role:        "model",
+		ContentJson: string(rawJSON),
+		// Legacy parts populated too (omitting non-text parts)
+		Parts: []*agentv1.SessionPart{
+			{Text: "Clean answer for Discord."},
+		},
+		Seq: 42,
+	}
+
+	converted := SessionTurnToContent(protoTurn)
+	if converted == nil {
+		t.Fatal("expected non-nil genai.Content from SessionTurnToContent")
+	}
+	if converted.Role != "model" {
+		t.Errorf("role mismatch: got %q, want 'model'", converted.Role)
+	}
+	if len(converted.Parts) != 3 {
+		t.Fatalf("expected 3 parts preserved 1:1, got %d", len(converted.Parts))
+	}
+
+	// 1. Thought flag preserved 1:1
+	if !converted.Parts[0].Thought || converted.Parts[0].Text != "Internal deliberation" {
+		t.Errorf("thought part mismatch: %+v", converted.Parts[0])
+	}
+
+	// 2. Function call part preserved 1:1 (now visible to bot for the first time)
+	if converted.Parts[1].FunctionCall == nil || converted.Parts[1].FunctionCall.Name != "bash" || converted.Parts[1].FunctionCall.ID != "call_456" {
+		t.Errorf("function call part mismatch: %+v", converted.Parts[1])
+	}
+
+	// 3. User text part preserved
+	if converted.Parts[2].Thought || converted.Parts[2].Text != "Clean answer for Discord." {
+		t.Errorf("text part mismatch: %+v", converted.Parts[2])
+	}
+
+	// 4. Render filter: FormatAssistantBackfillMessage drops thoughts and non-text parts
+	formatted := FormatAssistantBackfillMessage(converted)
+	if formatted != "Clean answer for Discord." {
+		t.Errorf("FormatAssistantBackfillMessage leaked thought or tool: got %q, want %q", formatted, "Clean answer for Discord.")
+	}
+
+	// 5. Render filter: contentText (!p.Thought at sync.go:118) drops thoughts and non-text parts
+	filteredText := contentText(converted)
+	if filteredText != "Clean answer for Discord." {
+		t.Errorf("contentText leaked thought or tool: got %q, want %q", filteredText, "Clean answer for Discord.")
+	}
+
+	// 6. Fallback test: when ContentJson is empty, falls back to legacy parts
+	legacyProtoTurn := &agentv1.SessionTurn{
+		Role: "user",
+		Parts: []*agentv1.SessionPart{
+			{Text: "legacy text"},
+		},
+	}
+	legacyConverted := SessionTurnToContent(legacyProtoTurn)
+	if legacyConverted == nil || len(legacyConverted.Parts) != 1 || legacyConverted.Parts[0].Text != "legacy text" {
+		t.Fatalf("legacy fallback mismatch: %+v", legacyConverted)
+	}
+}
