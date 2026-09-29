@@ -222,7 +222,7 @@ func (b *Bot) ProcessAttachments(ctx context.Context, agentID string, attachment
 
 		if isImageAttachment(att) {
 			if len(data) > 0 {
-				if _, addErr := b.Client.AddMedia(budgetCtx, &agentv1.AddMediaRequest{
+				if _, addErr := b.activeClient().AddMedia(budgetCtx, &agentv1.AddMediaRequest{
 					AgentId:      agentID,
 					MediaData:    data,
 					WorkspaceDir: b.WsDir,
@@ -249,7 +249,7 @@ func (b *Bot) ProcessAttachments(ctx context.Context, agentID string, attachment
 				}
 				mimeType = http.DetectContentType(prefix)
 			}
-			spResp, spErr := b.Client.CreateScratchpad(budgetCtx, &agentv1.CreateScratchpadRequest{
+			spResp, spErr := b.activeClient().CreateScratchpad(budgetCtx, &agentv1.CreateScratchpadRequest{
 				AgentId:      agentID,
 				CreatedBy:    createdBy,
 				WorkspaceDir: b.WsDir,

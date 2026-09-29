@@ -245,9 +245,9 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 
 	// Verify agent exists
-	insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: agentID, WorkspaceDir: b.WsDir})
+	insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: agentID, WorkspaceDir: b.WsDir})
 	if err != nil || insp == nil || !insp.GetAgentDirExists() {
-		listResp, listErr := b.Client.ListAgents(context.Background(), &agentv1.ListAgentsRequest{WorkspaceDir: b.WsDir})
+		listResp, listErr := b.activeClient().ListAgents(context.Background(), &agentv1.ListAgentsRequest{WorkspaceDir: b.WsDir})
 		availStr := "none"
 		if listErr != nil {
 			availStr = fmt.Sprintf("could not read the workspace, listing failed: %v", listErr)
@@ -281,7 +281,7 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	// rather than seed an empty baseline: lastIdx -1 looks identical to "nothing has been
 	// synced yet", and the next sync pass would then replay the agent's entire history into
 	// the channel as unsynced turns.
-	readResp, err := b.Client.ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: agentID, WorkspaceDir: b.WsDir})
+	readResp, err := b.activeClient().ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: agentID, WorkspaceDir: b.WsDir})
 	if err != nil {
 		b.respondInteraction(s, i, fmt.Sprintf("❌ Failed to read session history for agent %q, refusing to bind with an unknown baseline: %v", agentID, err), true)
 		return
@@ -352,13 +352,13 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, i *discordgo.Interaction
 		return
 	}
 
-	insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
+	insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
 	if err != nil || insp == nil || !insp.GetAgentDirExists() {
 		b.respondInteraction(s, i, fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`.", binding.AgentID, b.WsDir), true)
 		return
 	}
 
-	memResp, memErr := b.Client.ReadMemory(context.Background(), &agentv1.ReadMemoryRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
+	memResp, memErr := b.activeClient().ReadMemory(context.Background(), &agentv1.ReadMemoryRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
 	mem := ""
 	if memErr != nil {
 		mem = fmt.Sprintf("memory unavailable: %v", memErr)
@@ -441,7 +441,7 @@ func (b *Bot) handleFillCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 	syncUnlock()
 
-	insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
+	insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
 	if err != nil || insp == nil || !insp.GetAgentDirExists() {
 		b.editInteractionResponse(s, i, fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`.", binding.AgentID, b.WsDir))
 		return
@@ -500,7 +500,7 @@ func (b *Bot) handleVerboseCommand(s *discordgo.Session, i *discordgo.Interactio
 }
 
 func (b *Bot) handleAgentsCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	resp, err := b.Client.ListAgents(context.Background(), &agentv1.ListAgentsRequest{WorkspaceDir: b.WsDir})
+	resp, err := b.activeClient().ListAgents(context.Background(), &agentv1.ListAgentsRequest{WorkspaceDir: b.WsDir})
 	if err != nil {
 		b.respondInteraction(s, i, fmt.Sprintf("❌ Failed to list agents: %v", err), true)
 		return
@@ -515,7 +515,7 @@ func (b *Bot) handleAgentsCommand(s *discordgo.Session, i *discordgo.Interaction
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("📂 **Workspace Agents (%d found):**\n\n", len(ids)))
 	for _, id := range ids {
-		insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: id, WorkspaceDir: b.WsDir})
+		insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: id, WorkspaceDir: b.WsDir})
 		if err != nil || insp == nil {
 			sb.WriteString(fmt.Sprintf("• `%s` *(inspection error)*\n", id))
 			continue
@@ -556,7 +556,7 @@ func (b *Bot) handleStopCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
-	if _, err := b.Client.CancelTurn(context.Background(), &agentv1.CancelTurnRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir}); err != nil {
+	if _, err := b.activeClient().CancelTurn(context.Background(), &agentv1.CancelTurnRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir}); err != nil {
 		b.respondInteraction(s, i, fmt.Sprintf("ℹ️ No in-flight turn for agent **%s**.", binding.AgentID), false)
 		return
 	}
@@ -897,7 +897,7 @@ func (b *Bot) handleCompactCommand(s *discordgo.Session, i *discordgo.Interactio
 // sessionContextSnapshot decorates a compaction reply with turn and token counts. Errors
 // become nil: the verdict comes from the RPC, these numbers only explain it.
 func (b *Bot) sessionContextSnapshot(agentID string) *agentv1.InspectSessionContextResponse {
-	resp, err := b.Client.InspectSessionContext(context.Background(), &agentv1.InspectSessionContextRequest{
+	resp, err := b.activeClient().InspectSessionContext(context.Background(), &agentv1.InspectSessionContextRequest{
 		AgentId:      agentID,
 		WorkspaceDir: b.WsDir,
 	})

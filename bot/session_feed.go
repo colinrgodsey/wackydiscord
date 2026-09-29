@@ -141,7 +141,7 @@ func (f *sessionFeed) supervise(ctx context.Context, agentID string) {
 			return
 		}
 
-		stream, err := f.bot.Client.SubscribeSession(ctx, &agentv1.SubscribeSessionRequest{
+		stream, err := f.bot.activeClient().SubscribeSession(ctx, &agentv1.SubscribeSessionRequest{
 			AgentId:      agentID,
 			WorkspaceDir: f.bot.WsDir,
 		})

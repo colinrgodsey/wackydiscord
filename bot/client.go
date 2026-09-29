@@ -2,10 +2,14 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
@@ -51,9 +55,38 @@ type SpawnedServer struct {
 	// The full protocol client is embedded, so SpawnedServer satisfies AgentClient by
 	// construction and Close below is the only extra behavior the bot needs.
 	agentv1.AgentServiceClient
-	conn   *grpc.ClientConn
-	connMu sync.Mutex
-	closed bool
+	conn      *grpc.ClientConn
+	stdioConn *stdio.Conn
+	cmd       *exec.Cmd
+	died      chan error
+	waitDone  chan error
+	connMu    sync.Mutex
+	closed    bool
+}
+
+// Cmd returns the underlying exec.Cmd for the spawned child.
+func (s *SpawnedServer) Cmd() *exec.Cmd {
+	if s == nil {
+		return nil
+	}
+	return s.cmd
+}
+
+// Pid returns the process ID of the spawned child process, or 0 if not running.
+func (s *SpawnedServer) Pid() int {
+	if s == nil || s.cmd == nil || s.cmd.Process == nil {
+		return 0
+	}
+	return s.cmd.Process.Pid
+}
+
+// Died returns a receive-only channel that is sent an error when the downstream
+// server process exits unexpectedly while running.
+func (s *SpawnedServer) Died() <-chan error {
+	if s == nil {
+		return nil
+	}
+	return s.died
 }
 
 // SpawnServer launches bin in stdio-serve mode with its working directory set to the
@@ -65,10 +98,27 @@ func SpawnServer(ctx context.Context, bin, workspaceDir string) (*SpawnedServer,
 	cmd := exec.CommandContext(ctx, bin, "stdio-serve")
 	cmd.Dir = workspaceDir
 
-	conn, err := stdio.DialCommand(ctx, cmd, reapGrace)
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		return nil, fmt.Errorf("opening stdin pipe: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, fmt.Errorf("opening stdout pipe: %w", err)
+	}
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.WaitDelay = reapGrace
+
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
 		return nil, fmt.Errorf("spawning %s stdio-serve in %s: %w", bin, workspaceDir, err)
 	}
+
+	// Create client Conn without embedding cmd, so that SpawnedServer exclusively owns cmd.Wait.
+	conn := stdio.NewClientConn(nil, stdin, stdout, reapGrace)
 
 	gc, err := grpc.NewClient("passthrough:///stdio",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -76,9 +126,36 @@ func SpawnServer(ctx context.Context, bin, workspaceDir string) (*SpawnedServer,
 	)
 	if err != nil {
 		_ = conn.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
 		return nil, fmt.Errorf("constructing stdio grpc client: %w", err)
 	}
-	return &SpawnedServer{AgentServiceClient: agentv1.NewAgentServiceClient(gc), conn: gc}, nil
+
+	server := &SpawnedServer{
+		AgentServiceClient: agentv1.NewAgentServiceClient(gc),
+		conn:               gc,
+		stdioConn:          conn,
+		cmd:                cmd,
+		died:               make(chan error, 1),
+		waitDone:           make(chan error, 1),
+	}
+
+	go func() {
+		waitErr := cmd.Wait()
+		server.connMu.Lock()
+		closed := server.closed
+		server.connMu.Unlock()
+		server.waitDone <- waitErr
+		if !closed {
+			if waitErr == nil {
+				waitErr = errors.New("downstream wackypub protocol server exited unexpectedly")
+			}
+			server.died <- waitErr
+		}
+	}()
+
+	return server, nil
 }
 
 // dispatch picks the protocol client that serves agentID. Bridge routes are resolved by the
@@ -89,7 +166,7 @@ func (b *Bot) dispatch(agentID string) (AgentClient, func() error, error) {
 	if route, routed := routedAgentRoute(b.WsDir, agentID); routed {
 		return nil, nil, fmt.Errorf("agent %q is routed to a bridge (%s); wackydiscord drives native agents over the stdio protocol only", agentID, route)
 	}
-	return b.Client, func() error { return nil }, nil
+	return b.activeClient(), func() error { return nil }, nil
 }
 
 // Close tears down the connection and reaps the spawned child. Idempotent: the bot calls it
@@ -99,12 +176,44 @@ func (s *SpawnedServer) Close() error {
 		return nil
 	}
 	s.connMu.Lock()
-	defer s.connMu.Unlock()
 	if s.closed {
+		s.connMu.Unlock()
 		return nil
 	}
 	s.closed = true
-	return s.conn.Close()
+	s.connMu.Unlock()
+
+	var errs []error
+	if s.conn != nil {
+		if err := s.conn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if s.stdioConn != nil {
+		if err := s.stdioConn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	// Wait for child to exit on stdin EOF, escalating to SIGKILL on process group if reapGrace expires
+	select {
+	case err := <-s.waitDone:
+		if err != nil && !errors.Is(err, os.ErrProcessDone) && !strings.Contains(err.Error(), "signal: killed") {
+			// clean exit or normal signal
+		}
+	case <-time.After(reapGrace):
+		if s.cmd != nil && s.cmd.Process != nil {
+			pgid, err := syscall.Getpgid(s.cmd.Process.Pid)
+			if err == nil {
+				_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			} else {
+				_ = s.cmd.Process.Signal(syscall.SIGKILL)
+			}
+		}
+		<-s.waitDone
+	}
+
+	return errors.Join(errs...)
 }
 
 // Compile-time proof the narrowed view matches the real protocol client.

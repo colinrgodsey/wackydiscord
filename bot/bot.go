@@ -116,6 +116,11 @@ func NewBot(cfg Config) (*Bot, error) {
 	return b, nil
 }
 
+// activeClient returns the protocol client for operations.
+func (b *Bot) activeClient() AgentClient {
+	return b.Client
+}
+
 func (b *Bot) handleReady(s *discordgo.Session, r *discordgo.Ready) {
 	if s.State != nil && s.State.User != nil {
 		b.AppID = s.State.User.ID
@@ -141,7 +146,7 @@ func (b *Bot) ValidateBindings() []string {
 	var warnings []string
 	bindings := b.State.GetAllBindings()
 	for channelID, binding := range bindings {
-		insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
+		insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
 		if err != nil || insp == nil || !insp.GetAgentDirExists() {
 			warnings = append(warnings, fmt.Sprintf("channel %s is bound to missing agent %q in workspace %s", channelID, binding.AgentID, b.WsDir))
 		} else if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
@@ -151,26 +156,44 @@ func (b *Bot) ValidateBindings() []string {
 	return warnings
 }
 
-// Start opens the Discord WebSocket connection and blocks until context cancellation.
+// Start opens the Discord WebSocket connection and blocks until context cancellation
+// or downstream server process exit.
 func (b *Bot) Start(ctx context.Context) error {
-	if err := b.Session.Open(); err != nil {
-		return fmt.Errorf("failed to open discord gateway connection: %w", err)
+	if b.Session != nil {
+		if err := b.Session.Open(); err != nil {
+			return fmt.Errorf("failed to open discord gateway connection: %w", err)
+		}
+		defer b.Session.Close()
 	}
-	defer b.Session.Close()
 
 	if b.feed != nil {
 		b.feed.start(ctx)
 	}
 	defer func() {
-		if err := b.server.Close(); err != nil {
-			log.Printf("⚠️ agent protocol server shutdown error: %v", err)
+		if b.server != nil {
+			if err := b.server.Close(); err != nil {
+				log.Printf("⚠️ agent protocol server shutdown error: %v", err)
+			}
 		}
 	}()
 
 	log.Printf("🚀 WackyDiscord bot is running. Press Ctrl+C to exit.")
-	<-ctx.Done()
-	log.Printf("Shutting down WackyDiscord bot...")
-	return nil
+
+	var serverDied <-chan error
+	if b.server != nil {
+		serverDied = b.server.Died()
+	}
+
+	select {
+	case <-ctx.Done():
+		log.Printf("Shutting down WackyDiscord bot...")
+		return nil
+	case err := <-serverDied:
+		if ctx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("downstream wackypub protocol server died: %w", err)
+	}
 }
 
 // SyncAgentToChannels iterates through all channel bindings for an agent and backfills unseen turns.

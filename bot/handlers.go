@@ -65,7 +65,7 @@ func (b *Bot) resolveMessageContext(s *discordgo.Session, channelID string) (*Ch
 	}
 
 	// Verify bound agent exists and has valid configuration
-	insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
+	insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
 	if err != nil || insp == nil || !insp.GetAgentDirExists() {
 		b.say(s, channelID, "System", fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`. Use `/bind <agent_id>` to connect a valid agent.", binding.AgentID, b.WsDir), nil)
 		return nil, false
@@ -157,7 +157,7 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 
 	// Perform AddUserTurn WITHOUT holding LockChannelSync. Holding LockChannelSync across
 	// AddUserTurn deadlocks with callers that hold agent session locks and rebind channels.
-	res, addErr := b.Client.AddUserTurn(context.Background(), &agentv1.AddUserTurnRequest{
+	res, addErr := b.activeClient().AddUserTurn(context.Background(), &agentv1.AddUserTurnRequest{
 		AgentId:      binding.AgentID,
 		Message:      userText,
 		WorkspaceDir: b.WsDir,
@@ -214,7 +214,7 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 
 		ctx := context.Background()
 
-		turnStream, streamErr := b.Client.GenerateTurnStream(ctx, &agentv1.GenerateTurnStreamRequest{
+		turnStream, streamErr := b.activeClient().GenerateTurnStream(ctx, &agentv1.GenerateTurnStreamRequest{
 			AgentId:      binding.AgentID,
 			WorkspaceDir: b.WsDir,
 		})
@@ -308,7 +308,7 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		return 0, nil
 	}
 
-	resp, err := b.Client.ReadSession(context.Background(), &agentv1.ReadSessionRequest{
+	resp, err := b.activeClient().ReadSession(context.Background(), &agentv1.ReadSessionRequest{
 		AgentId:      bnd.AgentID,
 		WorkspaceDir: b.WsDir,
 	})
@@ -446,7 +446,7 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		} else {
 			text := FormatAssistantBackfillMessage(turn)
 			if text != "" {
-				text = ExpandScratchpadSentinels(b.Client, agentID, b.WsDir, text)
+				text = ExpandScratchpadSentinels(b.activeClient(), agentID, b.WsDir, text)
 				b.say(s, channelID, agentID, text, wh)
 			}
 		}
@@ -470,7 +470,7 @@ func (b *Bot) adoptSeqCursor(agentID string) {
 			unlock()
 			continue
 		}
-		resp, err := b.Client.ReadSession(context.Background(), &agentv1.ReadSessionRequest{
+		resp, err := b.activeClient().ReadSession(context.Background(), &agentv1.ReadSessionRequest{
 			AgentId:      agentID,
 			WorkspaceDir: b.WsDir,
 		})
