@@ -13,6 +13,8 @@ import (
 	"github.com/bwmarrin/discordgo"
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 	"google.golang.org/genai"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // HandleMessageCreate processes regular messages sent to bound Discord channels.
@@ -65,14 +67,21 @@ func (b *Bot) resolveMessageContext(s *discordgo.Session, channelID string) (*Ch
 	}
 
 	// Verify bound agent exists and has valid configuration
-	insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
-	if err != nil || insp == nil || !insp.GetAgentDirExists() {
-		b.say(s, channelID, "System", fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`. Use `/bind <agent_id>` to connect a valid agent.", binding.AgentID, b.WsDir), nil)
-		return nil, false
-	}
-	if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
-		b.say(s, channelID, "System", fmt.Sprintf("⚠️ **Agent Configuration Error:** Agent %q has an invalid `runtime.json`: %s", binding.AgentID, insp.GetRuntimeJsonError()), nil)
-		return nil, false
+	insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
+	if b.isBridged(binding.AgentID) {
+		if err != nil || insp == nil {
+			b.say(s, channelID, "System", fmt.Sprintf("❌ **Bridge error (%s):** %v", binding.AgentID, err), nil)
+			return nil, false
+		}
+	} else {
+		if err != nil || insp == nil || !insp.GetAgentDirExists() {
+			b.say(s, channelID, "System", fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`. Use `/bind <agent_id>` to connect a valid agent.", binding.AgentID, b.WsDir), nil)
+			return nil, false
+		}
+		if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
+			b.say(s, channelID, "System", fmt.Sprintf("⚠️ **Agent Configuration Error:** Agent %q has an invalid `runtime.json`: %s", binding.AgentID, insp.GetRuntimeJsonError()), nil)
+			return nil, false
+		}
 	}
 	return binding, true
 }
@@ -114,6 +123,11 @@ func (b *Bot) prepareUserText(s *discordgo.Session, m *discordgo.MessageCreate, 
 // notice when the turn didn't complete cleanly. It owns the IsGenerating bookkeeping
 // across dispatch and streaming.
 func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding *ChannelBinding, userText string) {
+	if b.isBridged(binding.AgentID) {
+		b.runBridgedTurn(s, m, binding, userText)
+		return
+	}
+
 	// 3. Mark channel as actively generating under LockChannelSync
 	expectedHash := ComputeTurnHash(genai.NewContentFromText(userText, "user"))
 	var shouldProceed bool
@@ -157,7 +171,7 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 
 	// Perform AddUserTurn WITHOUT holding LockChannelSync. Holding LockChannelSync across
 	// AddUserTurn deadlocks with callers that hold agent session locks and rebind channels.
-	res, addErr := b.Client.AddUserTurn(context.Background(), &agentv1.AddUserTurnRequest{
+	res, addErr := b.activeClient().AddUserTurn(context.Background(), &agentv1.AddUserTurnRequest{
 		AgentId:      binding.AgentID,
 		Message:      userText,
 		WorkspaceDir: b.WsDir,
@@ -214,7 +228,7 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 
 		ctx := context.Background()
 
-		turnStream, streamErr := b.Client.GenerateTurnStream(ctx, &agentv1.GenerateTurnStreamRequest{
+		turnStream, streamErr := b.activeClient().GenerateTurnStream(ctx, &agentv1.GenerateTurnStreamRequest{
 			AgentId:      binding.AgentID,
 			WorkspaceDir: b.WsDir,
 		})
@@ -223,7 +237,7 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 		}
 
 		// D112 tool-call visibility: live tool activity is rendered straight off the
-		// stream. Message text stays with the SessionWatcher, so the two renderers never
+		// stream. Message text stays with the session feed and turn backfill, so the two renderers never
 		// write the same content. Gated on /verbose like the backfilled tool detail.
 		liveBnd := b.State.GetBinding(m.ChannelID)
 		if liveBnd == nil {
@@ -271,6 +285,144 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 	}
 }
 
+// runBridgedTurn executes a turn for a remote bridged agent using AddAndGenerateTurnStream.
+// It streams live tool activity, accumulates the final assistant text, and delivers it
+// via persona webhook or bot message without relying on local session.jsonl.
+func (b *Bot) runBridgedTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding *ChannelBinding, userText string) {
+	var shouldProceed bool
+	func() {
+		syncUnlock := b.State.LockChannelSync(m.ChannelID)
+		defer syncUnlock()
+
+		bnd := b.State.GetBinding(m.ChannelID)
+		if bnd == nil || bnd.AgentID != binding.AgentID {
+			return
+		}
+
+		bnd.IsGenerating = true
+		if err := b.State.SetBinding(bnd); err != nil {
+			log.Printf("⚠️ failed to persist IsGenerating state in channel %s: %v", m.ChannelID, err)
+		}
+		shouldProceed = true
+	}()
+
+	if !shouldProceed {
+		return
+	}
+
+	defer func() {
+		syncUnlock := b.State.LockChannelSync(m.ChannelID)
+		defer syncUnlock()
+
+		bnd := b.State.GetBinding(m.ChannelID)
+		if bnd != nil && bnd.IsGenerating {
+			if bnd.AgentID != binding.AgentID {
+				log.Printf("⚠️ channel %s was rebound to agent %q during generation for %q; skipping deferred IsGenerating reset", m.ChannelID, bnd.AgentID, binding.AgentID)
+				return
+			}
+			bnd.IsGenerating = false
+			if err := b.State.SetBinding(bnd); err != nil {
+				log.Printf("⚠️ failed to reset IsGenerating in channel %s: %v", m.ChannelID, err)
+			}
+		}
+	}()
+
+	var wh *discordgo.Webhook
+	if binding.WebhookID != "" && binding.WebhookToken != "" {
+		wh = &discordgo.Webhook{ID: binding.WebhookID, Token: binding.WebhookToken}
+	} else if newWH, err := EnsureWebhook(s, m.ChannelID); err == nil && newWH != nil {
+		wh = newWH
+		func() {
+			syncUnlock := b.State.LockChannelSync(m.ChannelID)
+			defer syncUnlock()
+			if bnd := b.State.GetBinding(m.ChannelID); bnd != nil && bnd.AgentID == binding.AgentID {
+				bnd.WebhookID = newWH.ID
+				bnd.WebhookToken = newWH.Token
+				_ = b.State.SetBinding(bnd)
+			}
+		}()
+	}
+
+	var assistantText strings.Builder
+
+	streamErr := b.withTyping(s, m.ChannelID, func() error {
+		ctx := context.Background()
+
+		turnStream, err := b.activeClient().AddAndGenerateTurnStream(ctx, &agentv1.AddAndGenerateTurnStreamRequest{
+			AgentId:      binding.AgentID,
+			UserMessage:  userText,
+			WorkspaceDir: b.WsDir,
+		})
+		if err != nil {
+			return err
+		}
+
+		liveBnd := b.State.GetBinding(m.ChannelID)
+		if liveBnd == nil {
+			liveBnd = binding
+		}
+		var toolActivity *ToolActivity
+		if liveBnd.Verbose {
+			toolActivity = NewToolActivity(newChannelPoster(s, m.ChannelID, liveBnd))
+			defer toolActivity.Finish()
+		}
+
+		for {
+			resp, err := turnStream.Recv()
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if text := resp.GetText(); text != "" {
+				assistantText.WriteString(text)
+			}
+			if toolActivity != nil && (resp.GetToolCall() != nil || resp.GetToolCallUpdate() != nil) {
+				genResp := &agentv1.GenerateTurnStreamResponse{
+					ToolCall:       resp.GetToolCall(),
+					ToolCallUpdate: resp.GetToolCallUpdate(),
+				}
+				toolActivity.Observe(genResp)
+			}
+		}
+	})
+
+	func() {
+		syncUnlock := b.State.LockChannelSync(m.ChannelID)
+		defer syncUnlock()
+		if bnd := b.State.GetBinding(m.ChannelID); bnd != nil && bnd.AgentID == binding.AgentID {
+			bnd.IsGenerating = false
+			if err := b.State.SetBinding(bnd); err != nil {
+				log.Printf("⚠️ failed to reset IsGenerating in channel %s: %v", m.ChannelID, err)
+			}
+		}
+	}()
+
+	if streamErr != nil {
+		if errors.Is(streamErr, context.Canceled) || strings.Contains(streamErr.Error(), "context canceled") {
+			b.say(s, m.ChannelID, "System", "⏹️ Turn stopped.", nil)
+			return
+		}
+		var statusErr interface {
+			GRPCStatus() *status.Status
+		}
+		if errors.As(streamErr, &statusErr) {
+			if st := statusErr.GRPCStatus(); st != nil && st.Code() == codes.ResourceExhausted {
+				b.say(s, m.ChannelID, "System", fmt.Sprintf("⏳ **%s is busy:** Another turn is currently in flight. Please wait for it to complete.", binding.AgentID), nil)
+				return
+			}
+		}
+		b.say(s, m.ChannelID, "System", fmt.Sprintf("❌ **Bridge error (%s):** %v", binding.AgentID, streamErr), nil)
+		return
+	}
+
+	reply := strings.TrimSpace(assistantText.String())
+	if reply != "" {
+		b.say(s, m.ChannelID, binding.AgentID, reply, wh)
+	}
+}
+
 // withTyping runs fn while a background goroutine keeps the Discord typing indicator
 // alive on channelID, stopping the indicator once fn returns.
 func (b *Bot) withTyping(s *discordgo.Session, channelID string, fn func() error) error {
@@ -307,8 +459,12 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		syncUnlock()
 		return 0, nil
 	}
+	if b.isBridged(bnd.AgentID) {
+		syncUnlock()
+		return 0, nil
+	}
 
-	resp, err := b.Client.ReadSession(context.Background(), &agentv1.ReadSessionRequest{
+	resp, err := b.activeClient().ReadSession(context.Background(), &agentv1.ReadSessionRequest{
 		AgentId:      bnd.AgentID,
 		WorkspaceDir: b.WsDir,
 	})
@@ -446,7 +602,7 @@ func (b *Bot) autoFillUnsyncedTurns(s *discordgo.Session, binding *ChannelBindin
 		} else {
 			text := FormatAssistantBackfillMessage(turn)
 			if text != "" {
-				text = ExpandScratchpadSentinels(b.Client, agentID, b.WsDir, text)
+				text = ExpandScratchpadSentinels(b.activeClient(), agentID, b.WsDir, text)
 				b.say(s, channelID, agentID, text, wh)
 			}
 		}
@@ -470,7 +626,7 @@ func (b *Bot) adoptSeqCursor(agentID string) {
 			unlock()
 			continue
 		}
-		resp, err := b.Client.ReadSession(context.Background(), &agentv1.ReadSessionRequest{
+		resp, err := b.activeClient().ReadSession(context.Background(), &agentv1.ReadSessionRequest{
 			AgentId:      agentID,
 			WorkspaceDir: b.WsDir,
 		})

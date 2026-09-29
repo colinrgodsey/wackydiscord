@@ -85,7 +85,7 @@ func (f *sessionFeed) close() {
 
 // watch begins following an agent, called when a channel binds to it.
 func (f *sessionFeed) watch(agentID string) {
-	if f == nil || agentID == "" {
+	if f == nil || agentID == "" || (f.bot != nil && f.bot.isBridged(agentID)) {
 		return
 	}
 	f.mu.Lock()
@@ -115,7 +115,7 @@ func (f *sessionFeed) unwatch(agentID string) {
 // what the turn handler needs after it finishes generating: the session has grown and the
 // next push may already have been consumed.
 func (f *sessionFeed) trigger(agentID string) {
-	if f == nil || agentID == "" {
+	if f == nil || agentID == "" || (f.bot != nil && f.bot.isBridged(agentID)) {
 		return
 	}
 	f.mu.Lock()
@@ -141,7 +141,7 @@ func (f *sessionFeed) supervise(ctx context.Context, agentID string) {
 			return
 		}
 
-		stream, err := f.bot.Client.SubscribeSession(ctx, &agentv1.SubscribeSessionRequest{
+		stream, err := f.bot.activeClient().SubscribeSession(ctx, &agentv1.SubscribeSessionRequest{
 			AgentId:      agentID,
 			WorkspaceDir: f.bot.WsDir,
 		})
@@ -193,7 +193,7 @@ func (f *sessionFeed) consume(ctx context.Context, agentID string, stream agentv
 // turn handler uses it because it just grew the session itself and the next push may already
 // have been consumed before the write landed.
 func (f *sessionFeed) flushNow(agentID string) {
-	if f == nil || agentID == "" {
+	if f == nil || agentID == "" || (f.bot != nil && f.bot.isBridged(agentID)) {
 		return
 	}
 	f.bot.SyncAgentToChannels(agentID)
