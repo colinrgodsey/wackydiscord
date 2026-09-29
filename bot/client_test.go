@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -11,8 +12,8 @@ import (
 )
 
 func TestSpawnedServer_DiedOnChildSigkillMidUptime(t *testing.T) {
-	if _, err := os.Stat("/home/moltbot/.local/bin/wackypub"); err != nil {
-		t.Skip("wackypub binary not found, skipping live stdio-serve acceptance test")
+	if _, err := exec.LookPath("wackypub"); err != nil {
+		t.Fatalf("wackypub binary required on PATH for acceptance test, not found: %v", err)
 	}
 
 	wsDir := t.TempDir()
@@ -49,8 +50,8 @@ func TestSpawnedServer_DiedOnChildSigkillMidUptime(t *testing.T) {
 }
 
 func TestSpawnedServer_CloseDoesNotTriggerDied(t *testing.T) {
-	if _, err := os.Stat("/home/moltbot/.local/bin/wackypub"); err != nil {
-		t.Skip("wackypub binary not found, skipping live stdio-serve acceptance test")
+	if _, err := exec.LookPath("wackypub"); err != nil {
+		t.Fatalf("wackypub binary required on PATH for acceptance test, not found: %v", err)
 	}
 
 	wsDir := t.TempDir()
@@ -76,8 +77,8 @@ func TestSpawnedServer_CloseDoesNotTriggerDied(t *testing.T) {
 }
 
 func TestBot_StartExitsWhenChildDies(t *testing.T) {
-	if _, err := os.Stat("/home/moltbot/.local/bin/wackypub"); err != nil {
-		t.Skip("wackypub binary not found, skipping live stdio-serve acceptance test")
+	if _, err := exec.LookPath("wackypub"); err != nil {
+		t.Fatalf("wackypub binary required on PATH for acceptance test, not found: %v", err)
 	}
 
 	wsDir := t.TempDir()
