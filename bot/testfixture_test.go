@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,6 +18,8 @@ import (
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 	"google.golang.org/genai"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Fixtures for driving the bot without linking pkg/agent. Severing the module means the
@@ -152,15 +155,18 @@ func (l *sessionLock) Release() error {
 type fakeAgent struct {
 	wsDir string
 
-	mu           sync.Mutex
-	reply        string
-	cancelErr    error
-	addUserErr   error
-	streams      []func(*agentv1.GenerateTurnStreamResponse)
-	subEvents    chan *agentv1.SubscribeSessionResponse
-	compactCalls int
-	scratchpads  map[string]string
-	nextEntry    int
+	mu               sync.Mutex
+	reply            string
+	cancelErr        error
+	addUserErr       error
+	bridgeInspectErr error
+	addAndGenStreams []func(*agentv1.AddAndGenerateTurnStreamResponse)
+	addAndGenErr     error
+	streams          []func(*agentv1.GenerateTurnStreamResponse)
+	subEvents        chan *agentv1.SubscribeSessionResponse
+	compactCalls     int
+	scratchpads      map[string]string
+	nextEntry        int
 
 	cancelCalls int
 	inFlight    bool
@@ -180,7 +186,39 @@ func newFakeAgent(wsDir string) *fakeAgent {
 
 var _ AgentClient = (*fakeAgent)(nil)
 
+func (f *fakeAgent) checkBridgeRoute(agentID string) (string, bool, error) {
+	route, routed := routedAgentRoute(f.wsDir, agentID)
+	if !routed {
+		return "", false, nil
+	}
+	if strings.Contains(route, "/nonexistent") {
+		return route, true, &exec.Error{Name: route, Err: exec.ErrNotFound}
+	}
+	return route, true, nil
+}
+
 func (f *fakeAgent) InspectAgent(_ context.Context, in *agentv1.InspectAgentRequest, _ ...grpc.CallOption) (*agentv1.InspectAgentResponse, error) {
+	f.mu.Lock()
+	if f.bridgeInspectErr != nil {
+		err := f.bridgeInspectErr
+		f.mu.Unlock()
+		return nil, err
+	}
+	f.mu.Unlock()
+
+	_, routed, err := f.checkBridgeRoute(in.GetAgentId())
+	if routed {
+		if err != nil {
+			return nil, err
+		}
+		dir := agentDirIn(f.wsDir, in.GetAgentId())
+		return &agentv1.InspectAgentResponse{
+			AgentId:        in.GetAgentId(),
+			AgentDir:       dir,
+			AgentDirExists: false, // Honesty test: bridged agent does not have local agent dir
+		}, nil
+	}
+
 	dir := agentDirIn(f.wsDir, in.GetAgentId())
 	resp := &agentv1.InspectAgentResponse{AgentId: in.GetAgentId(), AgentDir: dir}
 	if st, err := os.Stat(dir); err == nil && st.IsDir() {
@@ -203,6 +241,29 @@ func (f *fakeAgent) ListAgents(_ context.Context, _ *agentv1.ListAgentsRequest, 
 	for _, e := range ents {
 		if e.IsDir() && !isHidden(e.Name()) {
 			ids = append(ids, e.Name())
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(f.wsDir, RemoteManifestFile)); err == nil {
+		scanner := bufio.NewScanner(bytes.NewReader(data))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			id, _, found := strings.Cut(line, ":")
+			if found {
+				id = strings.TrimSpace(id)
+				has := false
+				for _, existing := range ids {
+					if existing == id {
+						has = true
+						break
+					}
+				}
+				if !has {
+					ids = append(ids, id)
+				}
+			}
 		}
 	}
 	return &agentv1.ListAgentsResponse{AgentIds: ids}, nil
@@ -261,6 +322,12 @@ func (f *fakeAgent) AddUserTurn(_ context.Context, in *agentv1.AddUserTurnReques
 	f.mu.Unlock()
 	if err != nil {
 		return nil, err
+	}
+	if _, routed, bridgeErr := f.checkBridgeRoute(in.GetAgentId()); routed {
+		if bridgeErr != nil {
+			return nil, bridgeErr
+		}
+		return nil, status.Error(codes.Unimplemented, "AddUserTurn is not implemented by this harness")
 	}
 	dir := agentDirIn(f.wsDir, in.GetAgentId())
 	lock, err := acquireSessionLock(dir)
@@ -338,6 +405,12 @@ func (f *fakeAgent) InspectSessionContext(_ context.Context, in *agentv1.Inspect
 }
 
 func (f *fakeAgent) CompactSession(_ context.Context, in *agentv1.CompactSessionRequest, _ ...grpc.CallOption) (*agentv1.CompactSessionResponse, error) {
+	if _, routed, bridgeErr := f.checkBridgeRoute(in.GetAgentId()); routed {
+		if bridgeErr != nil {
+			return nil, bridgeErr
+		}
+		return nil, status.Error(codes.Unimplemented, "ACP bridged harness manages its own context compaction")
+	}
 	f.mu.Lock()
 	f.compactCalls++
 	f.mu.Unlock()
@@ -408,6 +481,14 @@ func (f *fakeAgent) CompactSession(_ context.Context, in *agentv1.CompactSession
 }
 
 func (f *fakeAgent) AsideQuestion(_ context.Context, in *agentv1.AsideQuestionRequest, _ ...grpc.CallOption) (*agentv1.AsideQuestionResponse, error) {
+	if in != nil {
+		if _, routed, bridgeErr := f.checkBridgeRoute(in.GetAgentId()); routed {
+			if bridgeErr != nil {
+				return nil, bridgeErr
+			}
+			return nil, status.Error(codes.Unimplemented, "bridged harness sessions cannot fork context")
+		}
+	}
 	dir := agentDirIn(f.wsDir, in.GetAgentId())
 	if rData, err := os.ReadFile(filepath.Join(dir, "runtime.json")); err == nil {
 		var rt struct {
@@ -468,7 +549,15 @@ func (f *fakeAgent) AsideQuestion(_ context.Context, in *agentv1.AsideQuestionRe
 	return &agentv1.AsideQuestionResponse{Text: "aside answer"}, nil
 }
 
-func (f *fakeAgent) AddMedia(_ context.Context, _ *agentv1.AddMediaRequest, _ ...grpc.CallOption) (*agentv1.AddMediaResponse, error) {
+func (f *fakeAgent) AddMedia(_ context.Context, in *agentv1.AddMediaRequest, _ ...grpc.CallOption) (*agentv1.AddMediaResponse, error) {
+	if in != nil {
+		if _, routed, bridgeErr := f.checkBridgeRoute(in.GetAgentId()); routed {
+			if bridgeErr != nil {
+				return nil, bridgeErr
+			}
+			return nil, status.Error(codes.Unimplemented, "ACP bridge does not accept media uploads")
+		}
+	}
 	return &agentv1.AddMediaResponse{}, nil
 }
 
@@ -523,6 +612,11 @@ func (f *fakeAgent) SubscribeSession(ctx context.Context, _ *agentv1.SubscribeSe
 
 func (f *fakeAgent) GenerateTurnStream(ctx context.Context, in *agentv1.GenerateTurnStreamRequest, _ ...grpc.CallOption) (agentv1.AgentService_GenerateTurnStreamClient, error) {
 	if in != nil {
+		if _, routed, bridgeErr := f.checkBridgeRoute(in.GetAgentId()); routed {
+			if bridgeErr != nil {
+				return nil, bridgeErr
+			}
+		}
 		dir := agentDirIn(f.wsDir, in.GetAgentId())
 		if rData, err := os.ReadFile(filepath.Join(dir, "runtime.json")); err == nil {
 			var rt struct {
@@ -577,6 +671,103 @@ func (f *fakeAgent) GenerateTurnStream(ctx context.Context, in *agentv1.Generate
 			f.mu.Unlock()
 		},
 	}, nil
+}
+
+func (f *fakeAgent) AddAndGenerateTurnStream(ctx context.Context, in *agentv1.AddAndGenerateTurnStreamRequest, _ ...grpc.CallOption) (agentv1.AgentService_AddAndGenerateTurnStreamClient, error) {
+	if in != nil {
+		if _, routed, bridgeErr := f.checkBridgeRoute(in.GetAgentId()); routed {
+			if bridgeErr != nil {
+				return nil, bridgeErr
+			}
+		}
+	}
+
+	f.mu.Lock()
+	if f.addAndGenErr != nil {
+		err := f.addAndGenErr
+		f.mu.Unlock()
+		return nil, err
+	}
+	f.inFlight = true
+	started := f.started
+	hold := f.hold
+	streamCtx, cancel := context.WithCancel(ctx)
+	f.cancelFunc = cancel
+	responses := make([]*agentv1.AddAndGenerateTurnStreamResponse, 0, len(f.addAndGenStreams))
+	for _, fill := range f.addAndGenStreams {
+		r := &agentv1.AddAndGenerateTurnStreamResponse{}
+		fill(r)
+		responses = append(responses, r)
+	}
+	if len(responses) == 0 && f.reply != "" {
+		responses = append(responses, &agentv1.AddAndGenerateTurnStreamResponse{
+			Text: f.reply,
+		})
+	}
+	f.mu.Unlock()
+
+	if started != nil {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+	}
+
+	return &fakeAddAndGenerateStream{
+		ctx:       streamCtx,
+		responses: responses,
+		hold:      hold,
+		onClose: func() {
+			f.mu.Lock()
+			f.inFlight = false
+			f.cancelFunc = nil
+			f.mu.Unlock()
+		},
+	}, nil
+}
+
+type fakeAddAndGenerateStream struct {
+	grpc.ClientStream
+	ctx       context.Context
+	responses []*agentv1.AddAndGenerateTurnStreamResponse
+	i         int
+	hold      chan struct{}
+	onClose   func()
+}
+
+func (s *fakeAddAndGenerateStream) Recv() (*agentv1.AddAndGenerateTurnStreamResponse, error) {
+	if s.hold != nil {
+		select {
+		case <-s.ctx.Done():
+			if s.onClose != nil {
+				s.onClose()
+				s.onClose = nil
+			}
+			return nil, s.ctx.Err()
+		case <-s.hold:
+		}
+	}
+	select {
+	case <-s.ctx.Done():
+		if s.onClose != nil {
+			s.onClose()
+			s.onClose = nil
+		}
+		return nil, s.ctx.Err()
+	default:
+	}
+
+	if s.i >= len(s.responses) {
+		if s.onClose != nil {
+			s.onClose()
+			s.onClose = nil
+		}
+		return nil, io.EOF
+	}
+	r := s.responses[s.i]
+	s.i++
+	return r, nil
 }
 
 type fakeTurnStream struct {

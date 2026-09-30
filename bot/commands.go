@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -245,9 +246,43 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 
 	// Verify agent exists
-	insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: agentID, WorkspaceDir: b.WsDir})
-	if err != nil || insp == nil || !insp.GetAgentDirExists() {
-		listResp, listErr := b.Client.ListAgents(context.Background(), &agentv1.ListAgentsRequest{WorkspaceDir: b.WsDir})
+	insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: agentID, WorkspaceDir: b.WsDir})
+	if b.isBridged(agentID) {
+		if err != nil || insp == nil {
+			var execErr *exec.Error
+			var exitErr *exec.ExitError
+			var statusErr interface {
+				GRPCStatus() *status.Status
+			}
+			if errors.Is(err, exec.ErrNotFound) || errors.As(err, &execErr) {
+				b.respondInteraction(s, i, fmt.Sprintf("❌ Cannot bind to %s: bridge executable not found (%v)", agentID, err), true)
+				return
+			}
+			if errors.As(err, &exitErr) {
+				b.respondInteraction(s, i, fmt.Sprintf("⚠️ Cannot bind to %s: bridge process failed to start: %v", agentID, err), true)
+				return
+			}
+			if errors.As(err, &statusErr) {
+				if st := statusErr.GRPCStatus(); st != nil {
+					switch st.Code() {
+					case codes.NotFound:
+						b.respondInteraction(s, i, fmt.Sprintf("❌ Cannot bind to %s: bridge executable not found (%v)", agentID, err), true)
+						return
+					case codes.Unavailable:
+						b.respondInteraction(s, i, fmt.Sprintf("⚠️ Cannot bind to %s: bridge process failed to start: %v", agentID, err), true)
+						return
+					}
+				}
+			}
+			if err == nil {
+				b.respondInteraction(s, i, fmt.Sprintf("❌ Cannot bind to %s: bridge error: inspect returned empty response", agentID), true)
+				return
+			}
+			b.respondInteraction(s, i, fmt.Sprintf("❌ Cannot bind to %s: bridge error: %v", agentID, err), true)
+			return
+		}
+	} else if err != nil || insp == nil || !insp.GetAgentDirExists() {
+		listResp, listErr := b.activeClient().ListAgents(context.Background(), &agentv1.ListAgentsRequest{WorkspaceDir: b.WsDir})
 		availStr := "none"
 		if listErr != nil {
 			availStr = fmt.Sprintf("could not read the workspace, listing failed: %v", listErr)
@@ -258,13 +293,15 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
-	if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
+	if !b.isBridged(agentID) && insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
 		b.respondInteraction(s, i, fmt.Sprintf("❌ Agent %q has an invalid `runtime.json`: %s", agentID, insp.GetRuntimeJsonError()), true)
 		return
 	}
 
 	modelName := "default"
-	if insp.GetRuntimeJsonValid() {
+	if b.isBridged(agentID) {
+		modelName = "bridged"
+	} else if insp.GetRuntimeJsonValid() {
 		if m, _ := runtimeSummary(insp.GetAgentDir()); m != "" {
 			modelName = m
 		}
@@ -281,16 +318,18 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	// rather than seed an empty baseline: lastIdx -1 looks identical to "nothing has been
 	// synced yet", and the next sync pass would then replay the agent's entire history into
 	// the channel as unsynced turns.
-	readResp, err := b.Client.ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: agentID, WorkspaceDir: b.WsDir})
-	if err != nil {
-		b.respondInteraction(s, i, fmt.Sprintf("❌ Failed to read session history for agent %q, refusing to bind with an unknown baseline: %v", agentID, err), true)
-		return
-	}
-	// Seed the cursor at the newest turn. Without a baseline the channel reads as never
-	// synced, and the first sync pass would replay the agent's whole history into Discord.
 	var seedSeq int64
-	if seeded := SessionTurnsWithSeq(readResp.GetTurns()); len(seeded) > 0 {
-		seedSeq = seeded[len(seeded)-1].Seq
+	if !b.isBridged(agentID) {
+		readResp, err := b.activeClient().ReadSession(context.Background(), &agentv1.ReadSessionRequest{AgentId: agentID, WorkspaceDir: b.WsDir})
+		if err != nil {
+			b.respondInteraction(s, i, fmt.Sprintf("❌ Failed to read session history for agent %q, refusing to bind with an unknown baseline: %v", agentID, err), true)
+			return
+		}
+		// Seed the cursor at the newest turn. Without a baseline the channel reads as never
+		// synced, and the first sync pass would replay the agent's whole history into Discord.
+		if seeded := SessionTurnsWithSeq(readResp.GetTurns()); len(seeded) > 0 {
+			seedSeq = seeded[len(seeded)-1].Seq
+		}
 	}
 
 	binding := &ChannelBinding{
@@ -310,7 +349,9 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
-	b.feed.watch(agentID)
+	if !b.isBridged(agentID) {
+		b.feed.watch(agentID)
+	}
 
 	b.respondInteraction(s, i, fmt.Sprintf("✅ Channel bound to agent **%s** (model: `%s`)!\nMessages sent in this channel will drive this agent.", agentID, modelName), false)
 }
@@ -352,13 +393,18 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, i *discordgo.Interaction
 		return
 	}
 
-	insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
-	if err != nil || insp == nil || !insp.GetAgentDirExists() {
+	insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
+	if b.isBridged(binding.AgentID) {
+		if err != nil || insp == nil {
+			b.respondInteraction(s, i, fmt.Sprintf("❌ **Bridge Error:** Could not inspect bound agent %q: %v", binding.AgentID, err), true)
+			return
+		}
+	} else if err != nil || insp == nil || !insp.GetAgentDirExists() {
 		b.respondInteraction(s, i, fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`.", binding.AgentID, b.WsDir), true)
 		return
 	}
 
-	memResp, memErr := b.Client.ReadMemory(context.Background(), &agentv1.ReadMemoryRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
+	memResp, memErr := b.activeClient().ReadMemory(context.Background(), &agentv1.ReadMemoryRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
 	mem := ""
 	if memErr != nil {
 		mem = fmt.Sprintf("memory unavailable: %v", memErr)
@@ -375,7 +421,15 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, i *discordgo.Interaction
 
 	modelName := "default"
 	endpoint := "default"
-	if insp.GetRuntimeJsonValid() {
+	if b.isBridged(binding.AgentID) {
+		modelName = "bridged"
+		bin := b.bridgeBinary(binding.AgentID)
+		if bin != "" {
+			endpoint = bin + " bridge"
+		} else {
+			endpoint = "remote bridge"
+		}
+	} else if insp.GetRuntimeJsonValid() {
 		m, ep := runtimeSummary(insp.GetAgentDir())
 		if m != "" {
 			modelName = m
@@ -439,9 +493,14 @@ func (b *Bot) handleFillCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		b.editInteractionResponse(s, i, fmt.Sprintf(errGeneratingBusy, "/fill"))
 		return
 	}
+	if b.isBridged(binding.AgentID) {
+		syncUnlock()
+		b.editInteractionResponse(s, i, fmt.Sprintf("ℹ️ Backfill is not supported for bridged agent **%s** (session history is managed by external harness).", binding.AgentID))
+		return
+	}
 	syncUnlock()
 
-	insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
+	insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
 	if err != nil || insp == nil || !insp.GetAgentDirExists() {
 		b.editInteractionResponse(s, i, fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`.", binding.AgentID, b.WsDir))
 		return
@@ -500,7 +559,7 @@ func (b *Bot) handleVerboseCommand(s *discordgo.Session, i *discordgo.Interactio
 }
 
 func (b *Bot) handleAgentsCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	resp, err := b.Client.ListAgents(context.Background(), &agentv1.ListAgentsRequest{WorkspaceDir: b.WsDir})
+	resp, err := b.activeClient().ListAgents(context.Background(), &agentv1.ListAgentsRequest{WorkspaceDir: b.WsDir})
 	if err != nil {
 		b.respondInteraction(s, i, fmt.Sprintf("❌ Failed to list agents: %v", err), true)
 		return
@@ -515,14 +574,17 @@ func (b *Bot) handleAgentsCommand(s *discordgo.Session, i *discordgo.Interaction
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("📂 **Workspace Agents (%d found):**\n\n", len(ids)))
 	for _, id := range ids {
-		insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: id, WorkspaceDir: b.WsDir})
+		insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: id, WorkspaceDir: b.WsDir})
 		if err != nil || insp == nil {
 			sb.WriteString(fmt.Sprintf("• `%s` *(inspection error)*\n", id))
 			continue
 		}
 		statusIcon := "⚪"
 		modelName := "default"
-		if insp.GetRuntimeJsonValid() {
+		if b.isBridged(id) {
+			statusIcon = "🟢"
+			modelName = "bridged"
+		} else if insp.GetRuntimeJsonValid() {
 			statusIcon = "🟢"
 			if m, _ := runtimeSummary(insp.GetAgentDir()); m != "" {
 				modelName = m
@@ -556,7 +618,7 @@ func (b *Bot) handleStopCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
-	if _, err := b.Client.CancelTurn(context.Background(), &agentv1.CancelTurnRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir}); err != nil {
+	if _, err := b.activeClient().CancelTurn(context.Background(), &agentv1.CancelTurnRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir}); err != nil {
 		b.respondInteraction(s, i, fmt.Sprintf("ℹ️ No in-flight turn for agent **%s**.", binding.AgentID), false)
 		return
 	}
@@ -689,7 +751,7 @@ func (b *Bot) handleAsideCommand(s *discordgo.Session, i *discordgo.InteractionC
 }
 
 // bridgeUnsupportedMessage recognises a bridge that refuses an RPC with codes.Unimplemented -
-// an ACP-bridged harness session cannot fork the agent's accumulated context, and cannot take
+// a remote bridged harness session cannot fork the agent's accumulated context, and cannot take
 // input without prompting it - and turns the refusal into the reply the caller should see,
 // keeping the bridge's own explanation instead of flattening a designed answer into "the
 // command failed". errors.As walks wrapped errors, so a dispatch layer that wrapped the status
@@ -879,6 +941,10 @@ func (b *Bot) handleCompactCommand(s *discordgo.Session, i *discordgo.Interactio
 		WorkspaceDir: b.WsDir,
 	})
 	if err != nil {
+		if msg, ok := bridgeUnsupportedMessage(binding.AgentID, "Compaction", err); ok {
+			b.editInteractionResponse(s, i, msg)
+			return
+		}
 		b.editInteractionResponse(s, i, fmt.Sprintf("❌ Compaction failed for **%s**: %v", binding.AgentID, err))
 		return
 	}
@@ -897,7 +963,7 @@ func (b *Bot) handleCompactCommand(s *discordgo.Session, i *discordgo.Interactio
 // sessionContextSnapshot decorates a compaction reply with turn and token counts. Errors
 // become nil: the verdict comes from the RPC, these numbers only explain it.
 func (b *Bot) sessionContextSnapshot(agentID string) *agentv1.InspectSessionContextResponse {
-	resp, err := b.Client.InspectSessionContext(context.Background(), &agentv1.InspectSessionContextRequest{
+	resp, err := b.activeClient().InspectSessionContext(context.Background(), &agentv1.InspectSessionContextRequest{
 		AgentId:      agentID,
 		WorkspaceDir: b.WsDir,
 	})

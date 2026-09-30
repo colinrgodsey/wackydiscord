@@ -37,3 +37,41 @@ func routedAgentRoute(wsDir, agentID string) (string, bool) {
 	}
 	return "", false
 }
+
+// isBridged reports whether agentID is routed to an external bridge via REMOTE_MANIFEST.
+func (b *Bot) isBridged(agentID string) bool {
+	if b == nil || agentID == "" {
+		return false
+	}
+	_, routed := routedAgentRoute(b.WsDir, agentID)
+	return routed
+}
+
+// routedAgentBinary returns the binary command basename from the REMOTE_MANIFEST entry for agentID.
+func routedAgentBinary(wsDir, agentID string) (string, bool) {
+	line, routed := routedAgentRoute(wsDir, agentID)
+	if !routed {
+		return "", false
+	}
+	_, cmdPart, found := strings.Cut(line, ":")
+	if !found {
+		return "", false
+	}
+	fields := strings.Fields(cmdPart)
+	if len(fields) == 0 {
+		return "", false
+	}
+	return filepath.Base(fields[0]), true
+}
+
+// bridgeBinary returns the binary name of the bridge handling agentID, or "remote" if unspecified.
+func (b *Bot) bridgeBinary(agentID string) string {
+	if b == nil || agentID == "" {
+		return ""
+	}
+	bin, routed := routedAgentBinary(b.WsDir, agentID)
+	if !routed || bin == "" {
+		return "remote"
+	}
+	return bin
+}

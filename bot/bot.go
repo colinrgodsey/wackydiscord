@@ -116,6 +116,11 @@ func NewBot(cfg Config) (*Bot, error) {
 	return b, nil
 }
 
+// activeClient returns the protocol client for operations.
+func (b *Bot) activeClient() AgentClient {
+	return b.Client
+}
+
 func (b *Bot) handleReady(s *discordgo.Session, r *discordgo.Ready) {
 	if s.State != nil && s.State.User != nil {
 		b.AppID = s.State.User.ID
@@ -141,7 +146,13 @@ func (b *Bot) ValidateBindings() []string {
 	var warnings []string
 	bindings := b.State.GetAllBindings()
 	for channelID, binding := range bindings {
-		insp, err := b.Client.InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
+		insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
+		if b.isBridged(binding.AgentID) {
+			if err != nil || insp == nil {
+				warnings = append(warnings, fmt.Sprintf("channel %s is bound to inaccessible bridged agent %q: %v", channelID, binding.AgentID, err))
+			}
+			continue
+		}
 		if err != nil || insp == nil || !insp.GetAgentDirExists() {
 			warnings = append(warnings, fmt.Sprintf("channel %s is bound to missing agent %q in workspace %s", channelID, binding.AgentID, b.WsDir))
 		} else if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
@@ -157,17 +168,21 @@ func (b *Bot) ValidateBindings() []string {
 // the watchdog threshold (or an unrecoverable spawn failure) makes Start return an error,
 // which the CLI turns into a non-zero exit so systemd restarts the service.
 func (b *Bot) Start(ctx context.Context) error {
-	if err := b.Session.Open(); err != nil {
-		return fmt.Errorf("failed to open discord gateway connection: %w", err)
+	if b.Session != nil {
+		if err := b.Session.Open(); err != nil {
+			return fmt.Errorf("failed to open discord gateway connection: %w", err)
+		}
+		defer b.Session.Close()
 	}
-	defer b.Session.Close()
 
 	if b.feed != nil {
 		b.feed.start(ctx)
 	}
 	defer func() {
-		if err := b.server.Close(); err != nil {
-			log.Printf("⚠️ agent protocol server shutdown error: %v", err)
+		if b.server != nil {
+			if err := b.server.Close(); err != nil {
+				log.Printf("⚠️ agent protocol server shutdown error: %v", err)
+			}
 		}
 	}()
 
@@ -188,6 +203,9 @@ func (b *Bot) Start(ctx context.Context) error {
 
 // SyncAgentToChannels iterates through all channel bindings for an agent and backfills unseen turns.
 func (b *Bot) SyncAgentToChannels(agentID string) {
+	if b.isBridged(agentID) {
+		return
+	}
 	bindings := b.State.GetAllBindings()
 	for _, binding := range bindings {
 		if binding.AgentID == agentID {

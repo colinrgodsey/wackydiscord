@@ -38,6 +38,7 @@ type AgentClient interface {
 	GetScratchpad(ctx context.Context, in *agentv1.GetScratchpadRequest, opts ...grpc.CallOption) (*agentv1.GetScratchpadResponse, error)
 	CreateScratchpad(ctx context.Context, in *agentv1.CreateScratchpadRequest, opts ...grpc.CallOption) (*agentv1.CreateScratchpadResponse, error)
 	ReadSessionEvents(ctx context.Context, in *agentv1.ReadSessionEventsRequest, opts ...grpc.CallOption) (*agentv1.ReadSessionEventsResponse, error)
+	AddAndGenerateTurnStream(ctx context.Context, in *agentv1.AddAndGenerateTurnStreamRequest, opts ...grpc.CallOption) (agentv1.AgentService_AddAndGenerateTurnStreamClient, error)
 	SubscribeSession(ctx context.Context, in *agentv1.SubscribeSessionRequest, opts ...grpc.CallOption) (agentv1.AgentService_SubscribeSessionClient, error)
 }
 
@@ -80,15 +81,10 @@ func spawnServerWithIdleTimeout(ctx context.Context, bin, workspaceDir string, i
 	return &SpawnedServer{AgentServiceClient: agentv1.NewAgentServiceClient(gc), conn: gc, dialer: dialer}, nil
 }
 
-// dispatch picks the protocol client that serves agentID. Bridge routes are resolved by the
-// caller of wackypub, never by its stdio service, which serves native agents only. Refusing
-// a routed agent is deliberate: falling through to the native client would let a same-named
-// local folder answer for an agent that lives behind a bridge.
+// dispatch picks the protocol client that serves agentID.
+// The stdio server resolves native-vs-bridged routing internally via ResolveAgentClient.
 func (b *Bot) dispatch(agentID string) (AgentClient, func() error, error) {
-	if route, routed := routedAgentRoute(b.WsDir, agentID); routed {
-		return nil, nil, fmt.Errorf("agent %q is routed to a bridge (%s); wackydiscord drives native agents over the stdio protocol only", agentID, route)
-	}
-	return b.Client, func() error { return nil }, nil
+	return b.activeClient(), func() error { return nil }, nil
 }
 
 // Close tears down the client: refuses new spawns, closes the transport, reaps the live
