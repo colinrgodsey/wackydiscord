@@ -112,8 +112,8 @@ func (d *ProcessDialer) lastDialError() error {
 // reap goroutine, and reading it from this one would race.
 func (d *ProcessDialer) childAlive() bool {
 	d.mu.Lock()
+	defer d.mu.Unlock()
 	cmd := d.activeCmd
-	d.mu.Unlock()
 	if cmd == nil || cmd.Process == nil {
 		return true
 	}
