@@ -26,7 +26,7 @@ type Bot struct {
 	Session *discordgo.Session
 	// Client is the protocol surface: every agent operation crosses the stdio boundary.
 	Client AgentClient
-	// server is the spawned wackypub backing Client. nil when Client was injected, which
+	// server is the stdio backend backing Client. nil when Client was injected, which
 	// is how the tests drive the bot without a binary.
 	server  *SpawnedServer
 	feed    *sessionFeed
@@ -151,7 +151,11 @@ func (b *Bot) ValidateBindings() []string {
 	return warnings
 }
 
-// Start opens the Discord WebSocket connection and blocks until context cancellation.
+// Start opens the Discord WebSocket connection and blocks until context cancellation or a
+// fatal downstream failure. A stdio child dying is not fatal by itself: gRPC reconnects
+// through the ProcessDialer with a fresh child. Only a transport that stays broken past
+// the watchdog threshold (or an unrecoverable spawn failure) makes Start return an error,
+// which the CLI turns into a non-zero exit so systemd restarts the service.
 func (b *Bot) Start(ctx context.Context) error {
 	if err := b.Session.Open(); err != nil {
 		return fmt.Errorf("failed to open discord gateway connection: %w", err)
@@ -167,10 +171,19 @@ func (b *Bot) Start(ctx context.Context) error {
 		}
 	}()
 
+	fatal := b.server.watchConnectivity(ctx)
+
 	log.Printf("🚀 WackyDiscord bot is running. Press Ctrl+C to exit.")
-	<-ctx.Done()
-	log.Printf("Shutting down WackyDiscord bot...")
-	return nil
+	select {
+	case <-ctx.Done():
+		log.Printf("Shutting down WackyDiscord bot...")
+		return nil
+	case err := <-fatal:
+		if err != nil {
+			log.Printf("🛑 %v", err)
+		}
+		return err
+	}
 }
 
 // SyncAgentToChannels iterates through all channel bindings for an agent and backfills unseen turns.

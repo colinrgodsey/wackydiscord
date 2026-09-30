@@ -2,14 +2,12 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"net"
-	"os/exec"
 	"sync"
 	"time"
 
 	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
-	"github.com/colinrgodsey/wackypub/pkg/stdio"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -43,42 +41,43 @@ type AgentClient interface {
 	SubscribeSession(ctx context.Context, in *agentv1.SubscribeSessionRequest, opts ...grpc.CallOption) (agentv1.AgentService_SubscribeSessionClient, error)
 }
 
-// SpawnedServer is a wackypub child serving AgentService over stdin/stdout, plus the
-// connection dialed through it. Close reaps the child; the bot holds exactly one of these
-// for its lifetime, because the watch subscription needs a long-lived stream and paying a
-// Go process start on every chat message would add startup latency to each one.
+// SpawnedServer is the protocol surface plus lifecycle for the bot's stdio backend. The
+// child process itself is owned by a ProcessDialer: every gRPC dial spawns a fresh
+// wackypub stdio-serve, so a child death is a transport disconnect that gRPC heals with a
+// re-dial, not a dead conn the bot must restart over. The watch subscription still needs
+// a long-lived stream, which the per-dial child provides for as long as it lives.
 type SpawnedServer struct {
 	// The full protocol client is embedded, so SpawnedServer satisfies AgentClient by
 	// construction and Close below is the only extra behavior the bot needs.
 	agentv1.AgentServiceClient
 	conn   *grpc.ClientConn
+	dialer *ProcessDialer
 	connMu sync.Mutex
 	closed bool
 }
 
-// SpawnServer launches bin in stdio-serve mode with its working directory set to the
-// resolved workspace root, so the child resolves agents exactly as the CLI would.
+// SpawnServer constructs the stdio protocol client with reconnection: the dialer spawns a
+// fresh child per dial, and the gRPC idle reaper is disabled (idle timeout 0), because its
+// 30-minute default closed the transport on idle, EOF'd the child's stdin, and killed it -
+// the observed restart spiral.
 func SpawnServer(ctx context.Context, bin, workspaceDir string) (*SpawnedServer, error) {
-	if bin == "" {
-		bin = DefaultWackypubBin
-	}
-	cmd := exec.CommandContext(ctx, bin, "stdio-serve")
-	cmd.Dir = workspaceDir
+	return spawnServerWithIdleTimeout(ctx, bin, workspaceDir, 0)
+}
 
-	conn, err := stdio.DialCommand(ctx, cmd, reapGrace)
-	if err != nil {
-		return nil, fmt.Errorf("spawning %s stdio-serve in %s: %w", bin, workspaceDir, err)
-	}
-
+// spawnServerWithIdleTimeout is SpawnServer with an explicit gRPC idle timeout, for tests
+// that exercise the idle mechanism on a short clock.
+func spawnServerWithIdleTimeout(ctx context.Context, bin, workspaceDir string, idleTimeout time.Duration) (*SpawnedServer, error) {
+	dialer := NewProcessDialer(ctx, bin, workspaceDir)
 	gc, err := grpc.NewClient("passthrough:///stdio",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return conn, nil }),
+		grpc.WithContextDialer(dialer.Dial),
+		grpc.WithIdleTimeout(idleTimeout),
 	)
 	if err != nil {
-		_ = conn.Close()
+		_ = dialer.Close()
 		return nil, fmt.Errorf("constructing stdio grpc client: %w", err)
 	}
-	return &SpawnedServer{AgentServiceClient: agentv1.NewAgentServiceClient(gc), conn: gc}, nil
+	return &SpawnedServer{AgentServiceClient: agentv1.NewAgentServiceClient(gc), conn: gc, dialer: dialer}, nil
 }
 
 // dispatch picks the protocol client that serves agentID. Bridge routes are resolved by the
@@ -92,8 +91,8 @@ func (b *Bot) dispatch(agentID string) (AgentClient, func() error, error) {
 	return b.Client, func() error { return nil }, nil
 }
 
-// Close tears down the connection and reaps the spawned child. Idempotent: the bot calls it
-// on shutdown and a failed start may call it too.
+// Close tears down the client: refuses new spawns, closes the transport, reaps the live
+// child. Idempotent: the bot calls it on shutdown and a failed start may call it too.
 func (s *SpawnedServer) Close() error {
 	if s == nil {
 		return nil
@@ -104,7 +103,16 @@ func (s *SpawnedServer) Close() error {
 		return nil
 	}
 	s.closed = true
-	return s.conn.Close()
+	var errs []error
+	if s.dialer != nil {
+		if err := s.dialer.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := s.conn.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // Compile-time proof the narrowed view matches the real protocol client.
