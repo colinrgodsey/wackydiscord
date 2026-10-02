@@ -299,8 +299,17 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 
 	modelName := "default"
+	var bindingModel string
 	if b.isBridged(agentID) {
+		// The bridged agent's model lives in the harness, not in runtime.json.
+		// Ask the model CLI for the confirmed value (wackyacp#22; the model-cli
+		// card's consumer path) and carry it on the binding so /status can
+		// surface it later. Degrade to the placeholder if the CLI cannot answer.
 		modelName = "bridged"
+		if m, err := b.bridgedModelGet(agentID); err == nil {
+			modelName = m
+		}
+		bindingModel = modelName
 	} else if insp.GetRuntimeJsonValid() {
 		if m, _ := runtimeSummary(insp.GetAgentDir()); m != "" {
 			modelName = m
@@ -339,6 +348,7 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		WebhookID:    whID,
 		WebhookToken: whToken,
 		LastSeq:      seedSeq,
+		Model:        bindingModel,
 	}
 
 	syncUnlock := b.State.LockChannelSync(i.ChannelID)
@@ -422,7 +432,13 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, i *discordgo.Interaction
 	modelName := "default"
 	endpoint := "default"
 	if b.isBridged(binding.AgentID) {
+		// Model was confirmed at bind time and carried on the binding
+		// (bridgedModelGet); keep the placeholder for bindings saved before
+		// that or when the CLI could not answer.
 		modelName = "bridged"
+		if binding.Model != "" {
+			modelName = binding.Model
+		}
 		bin := b.bridgeBinary(binding.AgentID)
 		if bin != "" {
 			endpoint = bin + " bridge"
