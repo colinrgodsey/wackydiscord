@@ -299,17 +299,12 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 
 	modelName := "default"
-	var bindingModel string
 	if b.isBridged(agentID) {
 		// The bridged agent's model lives in the harness, not in runtime.json.
-		// Ask the model CLI for the confirmed value (wackyacp#22; the model-cli
-		// card's consumer path) and carry it on the binding so /status can
-		// surface it later. Degrade to the placeholder if the CLI cannot answer.
+		// It is confirmed via the model CLI after the ack below (the CLI
+		// cold-spawns the harness and must not sit in Discord's 3s interaction
+		// window); the ack carries the placeholder and is edited in place.
 		modelName = "bridged"
-		if m, err := b.bridgedModelGet(agentID); err == nil {
-			modelName = m
-		}
-		bindingModel = modelName
 	} else if insp.GetRuntimeJsonValid() {
 		if m, _ := runtimeSummary(insp.GetAgentDir()); m != "" {
 			modelName = m
@@ -348,7 +343,6 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		WebhookID:    whID,
 		WebhookToken: whToken,
 		LastSeq:      seedSeq,
-		Model:        bindingModel,
 	}
 
 	syncUnlock := b.State.LockChannelSync(i.ChannelID)
@@ -363,7 +357,17 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		b.feed.watch(agentID)
 	}
 
-	b.respondInteraction(s, i, fmt.Sprintf("✅ Channel bound to agent **%s** (model: `%s`)!\nMessages sent in this channel will drive this agent.", agentID, modelName), false)
+	b.respondInteraction(s, i, bindAckMessage(agentID, modelName), false)
+
+	if b.isBridged(agentID) {
+		if m, err := b.bridgedModelGet(agentID); err == nil {
+			b.confirmBridgedModel(s, i, agentID, m)
+		}
+	}
+}
+
+func bindAckMessage(agentID, modelName string) string {
+	return fmt.Sprintf("✅ Channel bound to agent **%s** (model: `%s`)!\nMessages sent in this channel will drive this agent.", agentID, modelName)
 }
 
 func (b *Bot) handleUnbindCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {

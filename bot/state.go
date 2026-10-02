@@ -31,10 +31,11 @@ type ChannelBinding struct {
 	GuildID      string `json:"guild_id,omitempty"`
 	Verbose      bool   `json:"verbose"`
 	IsGenerating bool   `json:"is_generating,omitempty"`
-	// Model is the harness-confirmed model for bridged agents, resolved once
-	// at bind time via the model CLI (bridgedModelGet) and re-surfaced by
-	// /status. Empty for native agents (their model is read live from
-	// runtime.json) and for bindings saved before model-CLI support.
+	// Model is the harness-confirmed model for bridged agents, resolved via
+	// the model CLI after the bind ack (confirmBridgedModel) and re-surfaced
+	// by /status. Empty for native agents (their model is read live from
+	// runtime.json), for bindings saved before model-CLI support, and until
+	// the post-ack CLI resolution completes or degrades.
 	Model string `json:"model,omitempty"`
 	// LastSeq is the sync cursor: the seq of the newest session turn already rendered into
 	// this channel. It replaces the previous content-hash plus index pair, which had to be

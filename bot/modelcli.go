@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/bwmarrin/discordgo"
 )
 
 // modelCLITimeout bounds the bind-time model lookup. The model CLI spawns the
@@ -57,4 +60,23 @@ func (b *Bot) bridgedModelGet(agentID string) (string, error) {
 		return "", fmt.Errorf("model CLI for %s returned an empty model: %s", agentID, bytes.TrimSpace(out))
 	}
 	return resp.Model, nil
+}
+
+// confirmBridgedModel stores the model-CLI-confirmed model on the channel
+// binding and edits the bind ack in place with it. The binding is re-read
+// under the sync lock so an unbind or rebind during the CLI exec cannot
+// resurrect a stale binding or edit a superseded ack.
+func (b *Bot) confirmBridgedModel(s *discordgo.Session, i *discordgo.InteractionCreate, agentID, model string) {
+	syncUnlock := b.State.LockChannelSync(i.ChannelID)
+	defer syncUnlock()
+	bnd := b.State.GetBinding(i.ChannelID)
+	if bnd == nil || bnd.AgentID != agentID {
+		return
+	}
+	bnd.Model = model
+	if err := b.State.SetBinding(bnd); err != nil {
+		log.Printf("⚠️ failed to save confirmed model for channel %s: %v", i.ChannelID, err)
+		return
+	}
+	b.editInteractionResponse(s, i, bindAckMessage(agentID, model))
 }

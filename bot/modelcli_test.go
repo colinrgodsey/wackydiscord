@@ -60,6 +60,10 @@ func TestBindBridged_ModelCLIConfirmed(t *testing.T) {
 	if !strings.Contains(out, "Channel bound to agent **mtest**") {
 		t.Fatalf("expected successful bind, got: %q", out)
 	}
+	if !strings.Contains(out, "model: `bridged`") {
+		t.Fatalf("expected the ack to carry the placeholder, got: %q", out)
+	}
+	// ...and is edited in place with the CLI-confirmed model (post-ack).
 	if !strings.Contains(out, "model: `fake-model-7`") {
 		t.Fatalf("expected the CLI-confirmed model in the bind reply, got: %q", out)
 	}
@@ -101,8 +105,12 @@ func TestBindBridged_ModelCLIFallback(t *testing.T) {
 	if !strings.Contains(out, "model: `bridged`") {
 		t.Fatalf("expected the bridged placeholder on CLI failure, got: %q", out)
 	}
+	// CLI failure leaves the ack untouched: no second (edited) copy exists.
+	if n := strings.Count(out, "Channel bound to agent **flaky**"); n != 1 {
+		t.Fatalf("expected exactly the ack and no edit, got %d copies: %q", n, out)
+	}
 	bnd := b.State.GetBinding("chan_bridged")
-	if bnd == nil || bnd.Model != "bridged" {
-		t.Fatalf("binding.Model should be the placeholder: %+v", bnd)
+	if bnd == nil || bnd.Model != "" {
+		t.Fatalf("binding.Model should stay empty on CLI failure: %+v", bnd)
 	}
 }
