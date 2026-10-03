@@ -50,14 +50,21 @@ func (s *bridgedSpy) allOutput() string {
 }
 
 func setupBridgedBot(t *testing.T) (*Bot, *fakeAgent, *bridgedSpy, string) {
+	return setupBridgedBotManifest(t, func(ws string) string {
+		return "agy: /home/moltbot/workspace/projects/wackyacp/bin/wackyacp --agent-folder=" + filepath.Join(ws, "agy") + "\n" +
+			"broken: /nonexistent/bridge-binary --agent-folder=" + filepath.Join(ws, "broken") + "\n" +
+			"custom: /usr/local/bin/wackycustom --flag\n"
+	})
+}
+
+// setupBridgedBotManifest is setupBridgedBot with the REMOTE_MANIFEST content
+// delegated to manifestFor(ws).
+func setupBridgedBotManifest(t *testing.T, manifestFor func(ws string) string) (*Bot, *fakeAgent, *bridgedSpy, string) {
 	t.Helper()
 	ws := t.TempDir()
 
 	_ = os.WriteFile(filepath.Join(ws, "WACKYPUB_ROOT"), []byte(""), 0644)
-	manifest := "agy: /home/moltbot/workspace/projects/wackyacp/bin/wackyacp --agent-folder=" + filepath.Join(ws, "agy") + "\n" +
-		"broken: /nonexistent/bridge-binary --agent-folder=" + filepath.Join(ws, "broken") + "\n" +
-		"custom: /usr/local/bin/wackycustom --flag\n"
-	_ = os.WriteFile(filepath.Join(ws, RemoteManifestFile), []byte(manifest), 0644)
+	_ = os.WriteFile(filepath.Join(ws, RemoteManifestFile), []byte(manifestFor(ws)), 0644)
 
 	st, err := NewState(filepath.Join(ws, ".wackydiscord.json"))
 	if err != nil {
