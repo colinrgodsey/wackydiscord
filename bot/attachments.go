@@ -199,6 +199,7 @@ func (b *Bot) ProcessAttachments(ctx context.Context, agentID string, attachment
 		defer cancel()
 	}
 
+	bridgedImageNotice := false
 	for i := 0; i < processCount; i++ {
 		att := attachments[i]
 		if att == nil || att.URL == "" {
@@ -206,6 +207,15 @@ func (b *Bot) ProcessAttachments(ctx context.Context, agentID string, attachment
 		}
 
 		sanitizedName := SanitizeFilename(att.Filename)
+		if isImageAttachment(att) && b.isBridged(agentID) {
+			// Bridged harnesses refuse AddMedia; skip the download and tell the user
+			// instead of silently dropping the image.
+			if !bridgedImageNotice {
+				result.Notices = append(result.Notices, "\u274c Image attachments are not supported for bridged agents (ACP bridge does not accept media uploads).")
+				bridgedImageNotice = true
+			}
+			continue
+		}
 		data, err := downloadAttachment(budgetCtx, att.URL, MaxAttachmentBytes)
 		if err != nil {
 			if errors.Is(err, ErrAttachmentTooLarge) {

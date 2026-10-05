@@ -470,8 +470,10 @@ func TestBridged_OperationMatrixDegradation(t *testing.T) {
 
 // TestBridged_ImageAttachmentDelegated verifies that image attachments are passed through
 // to the protocol client (downstream bridge binary decides acceptance/refusal, no proactive rejection).
-func TestBridged_ImageAttachmentDelegated(t *testing.T) {
+func TestBridged_ImageAttachmentRejected(t *testing.T) {
+	var downloads int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads++
 		w.Header().Set("Content-Type", "image/png")
 		_, _ = w.Write([]byte("\x89PNG\r\n\x1a\nfake-png-bytes"))
 	}))
@@ -479,13 +481,19 @@ func TestBridged_ImageAttachmentDelegated(t *testing.T) {
 
 	b, _, _, _ := setupBridgedBot(t)
 
-	// Send an attachment with image MIME
+	// Two image attachments: the designed rejection is shown once, images are not fetched.
 	atts := []*discordgo.MessageAttachment{
 		{
 			ID:          "att_1",
 			Filename:    "screenshot.png",
 			ContentType: "image/png",
 			URL:         srv.URL + "/image.png",
+		},
+		{
+			ID:          "att_2",
+			Filename:    "chart.png",
+			ContentType: "image/png",
+			URL:         srv.URL + "/chart.png",
 		},
 	}
 
@@ -494,14 +502,20 @@ func TestBridged_ImageAttachmentDelegated(t *testing.T) {
 		t.Fatalf("ProcessAttachments failed: %v", err)
 	}
 
-	// Verify no proactive bot rejection notice was generated
+	matches := 0
 	for _, notice := range result.Notices {
 		if strings.Contains(notice, "Image attachments are not supported for bridged agents") {
-			t.Fatalf("unexpected proactive rejection notice: %s", notice)
+			matches++
 		}
 	}
+	if matches != 1 {
+		t.Fatalf("expected exactly one image rejection notice, got %d (notices: %v)", matches, result.Notices)
+	}
 	if result.ImagesDownloaded != 0 {
-		t.Fatalf("expected 0 downloaded images when bridge refuses, got: %d", result.ImagesDownloaded)
+		t.Fatalf("expected 0 downloaded images, got: %d", result.ImagesDownloaded)
+	}
+	if downloads != 0 {
+		t.Fatalf("expected no downloads for a bridged agent, got: %d", downloads)
 	}
 }
 
