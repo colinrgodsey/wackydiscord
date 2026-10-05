@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 
 	"github.com/bwmarrin/discordgo"
-	agentv1 "github.com/colinrgodsey/wackypub/pkg/agent/v1"
 )
 
 // Config defines the runtime configuration options for the WackyDiscord bot.
@@ -108,6 +107,10 @@ func NewBot(cfg Config) (*Bot, error) {
 	}
 	b.feed = newSessionFeed(b)
 
+	if err := awaitAgentService(context.Background(), server, absWsDir, agentReadinessTimeout, agentReadinessPollEvery); err != nil {
+		warnIfServiceUnreachable(err, absWsDir)
+	}
+
 	// Register event handlers
 	dg.AddHandler(b.handleReady)
 	dg.AddHandler(b.HandleInteraction)
@@ -146,17 +149,20 @@ func (b *Bot) ValidateBindings() []string {
 	var warnings []string
 	bindings := b.State.GetAllBindings()
 	for channelID, binding := range bindings {
-		insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
-		if b.isBridged(binding.AgentID) {
-			if err != nil || insp == nil {
+		presence, insp, err := b.classifyAgent(context.Background(), binding.AgentID)
+		switch presence {
+		case agentServiceUnreachable:
+			if b.isBridged(binding.AgentID) {
 				warnings = append(warnings, fmt.Sprintf("channel %s is bound to inaccessible bridged agent %q: %v", channelID, binding.AgentID, err))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("channel %s is bound to agent %q but agent service did not answer (workspace %s): %v", channelID, binding.AgentID, b.WsDir, err))
 			}
-			continue
-		}
-		if err != nil || insp == nil || !insp.GetAgentDirExists() {
+		case agentAbsent:
 			warnings = append(warnings, fmt.Sprintf("channel %s is bound to missing agent %q in workspace %s", channelID, binding.AgentID, b.WsDir))
-		} else if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
-			warnings = append(warnings, fmt.Sprintf("channel %s is bound to agent %q with invalid runtime.json: %s", channelID, binding.AgentID, insp.GetRuntimeJsonError()))
+		case agentAvailable:
+			if !b.isBridged(binding.AgentID) && insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
+				warnings = append(warnings, fmt.Sprintf("channel %s is bound to agent %q with invalid runtime.json: %s", channelID, binding.AgentID, insp.GetRuntimeJsonError()))
+			}
 		}
 	}
 	return warnings

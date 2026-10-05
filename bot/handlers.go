@@ -67,18 +67,20 @@ func (b *Bot) resolveMessageContext(s *discordgo.Session, channelID string) (*Ch
 	}
 
 	// Verify bound agent exists and has valid configuration
-	insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
-	if b.isBridged(binding.AgentID) {
-		if err != nil || insp == nil {
+	presence, insp, err := b.classifyAgentWithRetry(context.Background(), binding.AgentID)
+	switch presence {
+	case agentAbsent:
+		b.say(s, channelID, "System", fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`. Use `/bind <agent_id>` to connect a valid agent.", binding.AgentID, b.WsDir), nil)
+		return nil, false
+	case agentServiceUnreachable:
+		if b.isBridged(binding.AgentID) {
 			b.say(s, channelID, "System", fmt.Sprintf("❌ **Bridge error (%s):** %v", binding.AgentID, err), nil)
-			return nil, false
+		} else {
+			b.say(s, channelID, "System", fmt.Sprintf("⏳ **Not ready:** the agent service is not answering yet, so the binding for **%s** could not be verified. This is not a problem with the binding - try again in a moment.", binding.AgentID), nil)
 		}
-	} else {
-		if err != nil || insp == nil || !insp.GetAgentDirExists() {
-			b.say(s, channelID, "System", fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`. Use `/bind <agent_id>` to connect a valid agent.", binding.AgentID, b.WsDir), nil)
-			return nil, false
-		}
-		if insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
+		return nil, false
+	case agentAvailable:
+		if !b.isBridged(binding.AgentID) && insp.GetRuntimeJsonExists() && !insp.GetRuntimeJsonValid() {
 			b.say(s, channelID, "System", fmt.Sprintf("⚠️ **Agent Configuration Error:** Agent %q has an invalid `runtime.json`: %s", binding.AgentID, insp.GetRuntimeJsonError()), nil)
 			return nil, false
 		}

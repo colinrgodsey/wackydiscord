@@ -160,6 +160,8 @@ type fakeAgent struct {
 	cancelErr        error
 	addUserErr       error
 	bridgeInspectErr error
+	inspectErrs      []error
+	listErrs         []error
 	addAndGenStreams []func(*agentv1.AddAndGenerateTurnStreamResponse)
 	addAndGenErr     error
 	streams          []func(*agentv1.GenerateTurnStreamResponse)
@@ -173,6 +175,23 @@ type fakeAgent struct {
 	hold        chan struct{}
 	started     chan struct{}
 	cancelFunc  context.CancelFunc
+}
+
+func (f *fakeAgent) queueInspectFailures(errs ...error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.inspectErrs = append(f.inspectErrs, errs...)
+}
+
+func (f *fakeAgent) takeInspectErr() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.inspectErrs) == 0 {
+		return nil
+	}
+	err := f.inspectErrs[0]
+	f.inspectErrs = f.inspectErrs[1:]
+	return err
 }
 
 func newFakeAgent(wsDir string) *fakeAgent {
@@ -198,6 +217,9 @@ func (f *fakeAgent) checkBridgeRoute(agentID string) (string, bool, error) {
 }
 
 func (f *fakeAgent) InspectAgent(_ context.Context, in *agentv1.InspectAgentRequest, _ ...grpc.CallOption) (*agentv1.InspectAgentResponse, error) {
+	if err := f.takeInspectErr(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	if f.bridgeInspectErr != nil {
 		err := f.bridgeInspectErr
@@ -233,6 +255,15 @@ func (f *fakeAgent) InspectAgent(_ context.Context, in *agentv1.InspectAgentRequ
 }
 
 func (f *fakeAgent) ListAgents(_ context.Context, _ *agentv1.ListAgentsRequest, _ ...grpc.CallOption) (*agentv1.ListAgentsResponse, error) {
+	f.mu.Lock()
+	if len(f.listErrs) > 0 {
+		err := f.listErrs[0]
+		f.listErrs = f.listErrs[1:]
+		f.mu.Unlock()
+		return nil, err
+	}
+	f.mu.Unlock()
+
 	ents, err := os.ReadDir(f.wsDir)
 	if err != nil {
 		return nil, err
