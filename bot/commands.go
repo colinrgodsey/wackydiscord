@@ -246,9 +246,10 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 
 	// Verify agent exists
-	insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: agentID, WorkspaceDir: b.WsDir})
-	if b.isBridged(agentID) {
-		if err != nil || insp == nil {
+	presence, insp, err := b.classifyAgentWithRetry(context.Background(), agentID)
+	switch presence {
+	case agentServiceUnreachable:
+		if b.isBridged(agentID) {
 			var execErr *exec.Error
 			var exitErr *exec.ExitError
 			var statusErr interface {
@@ -281,7 +282,9 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 			b.respondInteraction(s, i, fmt.Sprintf("❌ Cannot bind to %s: bridge error: %v", agentID, err), true)
 			return
 		}
-	} else if err != nil || insp == nil || !insp.GetAgentDirExists() {
+		b.respondInteraction(s, i, fmt.Sprintf("⏳ **Not ready:** the agent service is not answering yet, so agent **%s** could not be verified: %v. Try again in a moment.", agentID, err), true)
+		return
+	case agentAbsent:
 		listResp, listErr := b.activeClient().ListAgents(context.Background(), &agentv1.ListAgentsRequest{WorkspaceDir: b.WsDir})
 		availStr := "none"
 		if listErr != nil {
@@ -407,14 +410,17 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, i *discordgo.Interaction
 		return
 	}
 
-	insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
-	if b.isBridged(binding.AgentID) {
-		if err != nil || insp == nil {
-			b.respondInteraction(s, i, fmt.Sprintf("❌ **Bridge Error:** Could not inspect bound agent %q: %v", binding.AgentID, err), true)
-			return
-		}
-	} else if err != nil || insp == nil || !insp.GetAgentDirExists() {
+	presence, insp, err := b.classifyAgentWithRetry(context.Background(), binding.AgentID)
+	switch presence {
+	case agentAbsent:
 		b.respondInteraction(s, i, fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`.", binding.AgentID, b.WsDir), true)
+		return
+	case agentServiceUnreachable:
+		if b.isBridged(binding.AgentID) {
+			b.respondInteraction(s, i, fmt.Sprintf("❌ **Bridge Error:** Could not inspect bound agent %q: %v", binding.AgentID, err), true)
+		} else {
+			b.respondInteraction(s, i, fmt.Sprintf("⏳ **Not ready:** the agent service is not answering yet, so status for **%s** could not be verified. Try again in a moment.", binding.AgentID), true)
+		}
 		return
 	}
 
@@ -520,9 +526,13 @@ func (b *Bot) handleFillCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 	syncUnlock()
 
-	insp, err := b.activeClient().InspectAgent(context.Background(), &agentv1.InspectAgentRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir})
-	if err != nil || insp == nil || !insp.GetAgentDirExists() {
+	presence, _, err := b.classifyAgentWithRetry(context.Background(), binding.AgentID)
+	switch presence {
+	case agentAbsent:
 		b.editInteractionResponse(s, i, fmt.Sprintf("❌ **Binding Error:** Bound agent %q does not exist in workspace `%s`.", binding.AgentID, b.WsDir))
+		return
+	case agentServiceUnreachable:
+		b.editInteractionResponse(s, i, fmt.Sprintf("⏳ **Not ready:** the agent service is not answering yet, so backfill for **%s** could not be performed: %v. Try again in a moment.", binding.AgentID, err))
 		return
 	}
 
@@ -638,8 +648,18 @@ func (b *Bot) handleStopCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
-	if _, err := b.activeClient().CancelTurn(context.Background(), &agentv1.CancelTurnRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir}); err != nil {
-		b.respondInteraction(s, i, fmt.Sprintf("ℹ️ No in-flight turn for agent **%s**.", binding.AgentID), false)
+	client := b.activeClient()
+	if client == nil {
+		b.respondInteraction(s, i, fmt.Sprintf("❌ Failed to cancel turn for agent **%s**: agent protocol client is not initialised", binding.AgentID), false)
+		return
+	}
+
+	if _, err := client.CancelTurn(context.Background(), &agentv1.CancelTurnRequest{AgentId: binding.AgentID, WorkspaceDir: b.WsDir}); err != nil {
+		if strings.Contains(err.Error(), "no in-flight turn") {
+			b.respondInteraction(s, i, fmt.Sprintf("ℹ️ No in-flight turn for agent **%s**.", binding.AgentID), false)
+			return
+		}
+		b.respondInteraction(s, i, fmt.Sprintf("❌ Failed to cancel turn for agent **%s**: %v", binding.AgentID, err), false)
 		return
 	}
 
@@ -729,12 +749,11 @@ func (b *Bot) handleAsideCommand(s *discordgo.Session, i *discordgo.InteractionC
 
 	// Resolved rather than called on the SDK directly, so a bridged agent gets the bridge's own
 	// answer - including its refusal - instead of a local agent nobody is talking to.
-	client, cleanup, err := b.dispatch(binding.AgentID)
-	if err != nil {
-		b.editInteractionResponse(s, i, fmt.Sprintf("❌ Could not reach agent **%s**: %v", binding.AgentID, err))
+	client := b.activeClient()
+	if client == nil {
+		b.editInteractionResponse(s, i, fmt.Sprintf("❌ Could not reach agent **%s**: agent protocol client is not initialised", binding.AgentID))
 		return
 	}
-	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), asideQuestionTimeout)
 	defer cancel()
@@ -864,12 +883,11 @@ func (b *Bot) handleAddCommand(s *discordgo.Session, i *discordgo.InteractionCre
 	// Resolved rather than called on the SDK directly, so a channel bound to a routed agent sends
 	// the append to the bridge that owns the session instead of writing into a local folder that
 	// nothing will ever read.
-	client, cleanup, err := b.dispatch(binding.AgentID)
-	if err != nil {
-		b.respondInteraction(s, i, queueFailure(binding.AgentID, err), false)
+	client := b.activeClient()
+	if client == nil {
+		b.respondInteraction(s, i, queueFailure(binding.AgentID, fmt.Errorf("agent protocol client is not initialised")), false)
 		return
 	}
-	defer cleanup()
 
 	res, err := client.AddUserTurn(context.Background(), &agentv1.AddUserTurnRequest{
 		AgentId:      binding.AgentID,
@@ -946,12 +964,11 @@ func (b *Bot) handleCompactCommand(s *discordgo.Session, i *discordgo.Interactio
 
 	// Resolved rather than called on the SDK directly, so a channel bound to a routed agent
 	// sends compaction to the bridge that owns the session instead of hunting for a local one.
-	client, cleanup, err := b.dispatch(binding.AgentID)
-	if err != nil {
-		b.editInteractionResponse(s, i, fmt.Sprintf("❌ Could not reach agent **%s**: %v", binding.AgentID, err))
+	client := b.activeClient()
+	if client == nil {
+		b.editInteractionResponse(s, i, fmt.Sprintf("❌ Could not reach agent **%s**: agent protocol client is not initialised", binding.AgentID))
 		return
 	}
-	defer cleanup()
 
 	before := b.sessionContextSnapshot(binding.AgentID)
 
