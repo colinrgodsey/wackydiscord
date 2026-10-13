@@ -181,9 +181,7 @@ func (b *Bot) Start(ctx context.Context) error {
 		defer b.Session.Close()
 	}
 
-	if b.feed != nil {
-		b.feed.start(ctx)
-	}
+	b.startFeed(ctx)
 	defer func() {
 		if b.server != nil {
 			if err := b.server.Close(); err != nil {
@@ -204,6 +202,35 @@ func (b *Bot) Start(ctx context.Context) error {
 			log.Printf("🛑 %v", err)
 		}
 		return err
+	}
+}
+
+// startFeed launches the session feed worker and re-arms subscriptions for every
+// persisted binding. feed.start() alone starts the worker/supervisors but watches
+// nothing; the re-arm is what keeps cross-client turns surfacing after a restart
+// (see watchExistingBindings). Kept as its own seam so tests can drive the real
+// startup wiring without a discord gateway or a spawned server.
+func (b *Bot) startFeed(ctx context.Context) {
+	if b.feed == nil {
+		return
+	}
+	b.feed.start(ctx)
+	b.watchExistingBindings()
+}
+
+// watchExistingBindings subscribes the session feed to every persisted binding at
+// startup, mirroring the retired fsnotify watcher which watched all bound agents
+// when it started (watcher.go Start()). feed.start() only launches the worker and
+// supervisors; without this pass a binding loaded from state gets NO subscription
+// until it is bound again, so cross-client turns never surface in Discord (the D118
+// async-watch regression: tools changes fired the old file watch regardless of
+// writer; the protocol subscription must be re-armed for every binding).
+func (b *Bot) watchExistingBindings() {
+	bindings := b.State.GetAllBindings()
+	for _, binding := range bindings {
+		if binding.AgentID != "" {
+			b.feed.watch(binding.AgentID)
+		}
 	}
 }
 
