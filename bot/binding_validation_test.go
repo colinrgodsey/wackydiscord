@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bwmarrin/discordgo"
 )
 
 // The bug these pin: an unreachable agent service and an agent folder that really is gone both
@@ -185,5 +187,67 @@ func TestAwaitAgentServiceTimesOutWithAccurateError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "did not become ready") {
 		t.Errorf("error should name the readiness failure, got %v", err)
+	}
+}
+
+func TestCommandsDistinguishAbsentFromUnreachable(t *testing.T) {
+	b, fake, spy, _ := setupBridgedBot(t)
+	// Bind channel to a native agent "bob"
+	if err := b.State.SetBinding(&ChannelBinding{ChannelID: "chan_bridged", AgentID: "bob"}); err != nil {
+		t.Fatalf("SetBinding: %v", err)
+	}
+
+	// 1. /status command: service unreachable must report "Not ready" instead of "does not exist"
+	fake.queueInspectFailures(errors.New("connection refused"), errors.New("connection refused"), errors.New("connection refused"))
+	iStatus := makeInteraction("status", nil)
+	b.handleStatusCommand(b.Session, iStatus)
+	out := spy.allOutput()
+	if !strings.Contains(out, "Not ready") || strings.Contains(out, "does not exist") {
+		t.Errorf("status on unreachable service must report Not ready, got: %q", out)
+	}
+
+	// 2. /fill command: service unreachable must report "Not ready" instead of "does not exist"
+	fake.queueInspectFailures(errors.New("connection refused"), errors.New("connection refused"), errors.New("connection refused"))
+	iFill := makeInteraction("fill", nil)
+	b.handleFillCommand(b.Session, iFill)
+	out = spy.allOutput()
+	if !strings.Contains(out, "Not ready") || strings.Contains(out, "does not exist") {
+		t.Errorf("fill on unreachable service must report Not ready, got: %q", out)
+	}
+
+	// 3. /bind command: service unreachable must report "Not ready" instead of "was not found"
+	fake.queueInspectFailures(errors.New("connection refused"), errors.New("connection refused"), errors.New("connection refused"))
+	iBind := makeInteraction("bind", []*discordgo.ApplicationCommandInteractionDataOption{
+		{Name: "agent", Type: discordgo.ApplicationCommandOptionString, Value: any("alice")},
+	})
+	b.handleBindCommand(b.Session, iBind)
+	out = spy.allOutput()
+	if !strings.Contains(out, "Not ready") || strings.Contains(out, "was not found") {
+		t.Errorf("bind on unreachable service must report Not ready, got: %q", out)
+	}
+
+	// 4. /stop command: transport error on CancelTurn must report failure rather than "No in-flight turn"
+	fake.mu.Lock()
+	fake.cancelErr = errors.New("transport is closing")
+	fake.mu.Unlock()
+	iStop := makeInteraction("stop", nil)
+	b.handleStopCommand(b.Session, iStop)
+	spy.mu.Lock()
+	lastInteraction := spy.interactions[len(spy.interactions)-1]
+	spy.mu.Unlock()
+	if !strings.Contains(lastInteraction, "Failed to cancel turn") || strings.Contains(lastInteraction, "No in-flight turn") {
+		t.Errorf("stop with transport failure must report failure, got: %q", lastInteraction)
+	}
+
+	// 5. /stop command: genuine no-turn error from CancelTurn still reports informational notice
+	fake.mu.Lock()
+	fake.cancelErr = errors.New("no in-flight turn for agent \"bob\"")
+	fake.mu.Unlock()
+	b.handleStopCommand(b.Session, iStop)
+	spy.mu.Lock()
+	lastInteraction = spy.interactions[len(spy.interactions)-1]
+	spy.mu.Unlock()
+	if !strings.Contains(lastInteraction, "No in-flight turn for agent") || strings.Contains(lastInteraction, "Failed to cancel") {
+		t.Errorf("stop with no in-flight turn must report informational notice, got: %q", lastInteraction)
 	}
 }

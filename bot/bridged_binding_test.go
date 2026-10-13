@@ -468,8 +468,8 @@ func TestBridged_OperationMatrixDegradation(t *testing.T) {
 	})
 }
 
-// TestBridged_ImageAttachmentDelegated verifies that image attachments are passed through
-// to the protocol client (downstream bridge binary decides acceptance/refusal, no proactive rejection).
+// TestBridged_ImageAttachmentRejected verifies that image attachments for bridged agents
+// are proactively rejected with an informative notice rather than passed downstream.
 func TestBridged_ImageAttachmentRejected(t *testing.T) {
 	var downloads int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

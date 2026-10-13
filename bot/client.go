@@ -81,12 +81,6 @@ func spawnServerWithIdleTimeout(ctx context.Context, bin, workspaceDir string, i
 	return &SpawnedServer{AgentServiceClient: agentv1.NewAgentServiceClient(gc), conn: gc, dialer: dialer}, nil
 }
 
-// dispatch picks the protocol client that serves agentID.
-// The stdio server resolves native-vs-bridged routing internally via ResolveAgentClient.
-func (b *Bot) dispatch(agentID string) (AgentClient, func() error, error) {
-	return b.activeClient(), func() error { return nil }, nil
-}
-
 // Close tears down the client: refuses new spawns, closes the transport, reaps the live
 // child. Idempotent: the bot calls it on shutdown and a failed start may call it too.
 func (s *SpawnedServer) Close() error {
