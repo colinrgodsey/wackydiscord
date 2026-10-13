@@ -232,7 +232,7 @@ var (
 // and substitutes the referenced scratchpad text inline via sdk.GetScratchpad.
 // If resolution fails (e.g. entry missing or evicted), the tag is left untouched (graceful fallback).
 func ExpandScratchpadSentinels(client AgentClient, agentID string, wsDir string, text string) string {
-	if client == nil || agentID == "" || (!strings.Contains(text, "<SCRATCHPAD_EXPAND") && !strings.Contains(text, "<scratchpad_expand")) {
+	if client == nil || agentID == "" || !strings.Contains(strings.ToLower(text), "<scratchpad_expand") {
 		return text
 	}
 

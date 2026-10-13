@@ -421,6 +421,7 @@ func (b *Bot) runBridgedTurn(s *discordgo.Session, m *discordgo.MessageCreate, b
 
 	reply := strings.TrimSpace(assistantText.String())
 	if reply != "" {
+		reply = ExpandScratchpadSentinels(b.activeClient(), binding.AgentID, b.WsDir, reply)
 		b.say(s, m.ChannelID, binding.AgentID, reply, wh)
 	}
 }

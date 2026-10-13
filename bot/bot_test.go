@@ -432,6 +432,16 @@ func TestFormattingHelpers(t *testing.T) {
 		if s := ExpandScratchpadSentinels(sdk, "bob", "", plainText); s != plainText {
 			t.Errorf("expected unchanged text, got %q", s)
 		}
+
+		// 5. Mixed-case sentinel: the gate used to check only two exact spellings
+		// while the regex was (?i) - <Scratchpad_Expand> slipped the gate and never
+		// expanded. The gate is now case-insensitive.
+		rawText4 := fmt.Sprintf("Mixed case: <Scratchpad_Expand id=%q />", entry1.GetEntryId())
+		expanded4 := ExpandScratchpadSentinels(sdk, "bob", "", rawText4)
+		expected4 := "Mixed case: The rain fell heavily across Neo-Tokyo."
+		if expanded4 != expected4 {
+			t.Errorf("expected mixed-case sentinel to expand: got %q, want %q", expanded4, expected4)
+		}
 	})
 }
 
@@ -1568,5 +1578,46 @@ func TestSessionTurnToContent_ContentJSONFaithfulRoundTrip(t *testing.T) {
 	legacyConverted := SessionTurnToContent(legacyProtoTurn)
 	if legacyConverted == nil || len(legacyConverted.Parts) != 1 || legacyConverted.Parts[0].Text != "legacy text" {
 		t.Fatalf("legacy fallback mismatch: %+v", legacyConverted)
+	}
+}
+
+// TestLiveTurn_ExpandsScratchpadSentinelBeforePost pins the D112 live-delivery
+// regression: the backfill path expands scratchpad sentinels, but the LIVE
+// bridged-turn reply used to post raw. D61 originally expanded on both paths;
+// the D112 protocol change (#17) dropped the live side. A sentinel in a
+// streamed bridged reply must expand before b.say posts it.
+func TestLiveTurn_ExpandsScratchpadSentinelBeforePost(t *testing.T) {
+	b, sdk, spy, _ := setupBridgedBot(t)
+	_ = b.State.SetBinding(&ChannelBinding{ChannelID: "chan_bridged", AgentID: "agy"})
+
+	// Create the scratchpad the sentinel will reference.
+	resp, err := sdk.CreateScratchpad(context.Background(), &agentv1.CreateScratchpadRequest{
+		AgentId:   "agy",
+		Text:      "LIVE-EXPANDED-CONTENT",
+		CreatedBy: "test",
+	})
+	if err != nil {
+		t.Fatalf("CreateScratchpad failed: %v", err)
+	}
+	entry := resp.GetEntry()
+
+	// The streamed live reply carries the sentinel - exactly what a bridged model
+	// turn emits in streaming mode. The bridged path posts this reply directly
+	// (runBridgedTurn -> b.say), unlike the native path which renders via the feed.
+	rawReply := fmt.Sprintf("Prologue: <SCRATCHPAD_EXPAND id=%q />", entry.GetEntryId())
+	sdk.mu.Lock()
+	sdk.addAndGenStreams = []func(*agentv1.AddAndGenerateTurnStreamResponse){
+		func(r *agentv1.AddAndGenerateTurnStreamResponse) { r.Text = rawReply },
+	}
+	sdk.mu.Unlock()
+
+	b.HandleMessageCreate(b.Session, makeMessage("tell the story"))
+
+	output := spy.allOutput()
+	if strings.Contains(output, "<SCRATCHPAD_EXPAND") {
+		t.Errorf("live bridged reply posted the raw sentinel: %q", output)
+	}
+	if !strings.Contains(output, "LIVE-EXPANDED-CONTENT") {
+		t.Errorf("live bridged reply should have expanded the sentinel, got: %q", output)
 	}
 }
