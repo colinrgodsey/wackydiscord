@@ -282,6 +282,11 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 			b.say(s, m.ChannelID, "System", "⏹️ Turn stopped.", nil)
 			return
 		}
+		if text, ok := b.describeServiceError(streamErr); ok {
+			log.Printf("⚠️ turn in channel %s lost the agent service mid-call: %v", m.ChannelID, streamErr)
+			b.say(s, m.ChannelID, "System", text, nil)
+			return
+		}
 		b.say(s, m.ChannelID, "System", fmt.Sprintf("❌ **Agent error:** %v", streamErr), nil)
 		return
 	}

@@ -107,3 +107,13 @@ func (s *SpawnedServer) Close() error {
 
 // Compile-time proof the narrowed view matches the real protocol client.
 var _ AgentClient = agentv1.AgentServiceClient(nil)
+
+// childTerminatedByUs reports whether the bot's own dialer ended the serving child. The
+// dialer pointer is fixed at construction, so this needs no lock; a bot running on an
+// injected client has no server and reads as not-ours.
+func (s *SpawnedServer) childTerminatedByUs() killKind {
+	if s == nil {
+		return killNotOurs
+	}
+	return s.dialer.killedOnPurpose()
+}

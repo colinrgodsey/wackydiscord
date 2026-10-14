@@ -25,6 +25,17 @@ import (
 // after every successful dial. If the dial context expires mid-spawn, the
 // child just started is reaped before the error is returned, so failed dials
 // leave no orphans.
+// killKind records a child the dialer terminated itself. A mid-call failure that follows one
+// of these means the service was replaced or shut down on purpose, which is a different
+// message to a channel than a child that died on its own.
+type killKind int
+
+const (
+	killNotOurs killKind = iota
+	killReplaced
+	killShutdown
+)
+
 type ProcessDialer struct {
 	mu         sync.Mutex
 	bin        string
@@ -34,6 +45,7 @@ type ProcessDialer struct {
 	activeConn *stdio.Conn
 	lastCmd    *exec.Cmd // most recent spawn attempt (live or reaped); diagnostics and tests
 	closed     bool
+	ours       killKind
 	lastErr    error
 }
 
@@ -70,6 +82,7 @@ func (d *ProcessDialer) Dial(ctx context.Context, target string) (net.Conn, erro
 		_ = d.activeConn.Close()
 		d.activeConn = nil
 		d.activeCmd = nil
+		d.ours = killReplaced
 	}
 
 	cmd := exec.Command(d.bin, "stdio-serve")
@@ -138,6 +151,7 @@ func (d *ProcessDialer) Close() error {
 		return nil
 	}
 	d.closed = true
+	d.ours = killShutdown
 	var err error
 	if d.activeConn != nil {
 		err = d.activeConn.Close()
@@ -166,4 +180,14 @@ func isPermanentSpawnError(err error) bool {
 	}
 	errno, ok := pathErr.Err.(syscall.Errno)
 	return ok && (errno == syscall.ENOENT || errno == syscall.ENOEXEC)
+}
+
+// killedOnPurpose reports whether the dialer itself ended the child it last had, and why.
+func (d *ProcessDialer) killedOnPurpose() killKind {
+	if d == nil {
+		return killNotOurs
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.ours
 }
