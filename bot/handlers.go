@@ -208,7 +208,7 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 		log.Printf("⚠️ hook warning for agent %s: %s", binding.AgentID, w)
 	}
 
-	streamErr := b.withTyping(s, m.ChannelID, func() error {
+	streamErr := b.withTyping(s, binding.AgentID, m.ChannelID, func() error {
 		// 4. Ensure Webhook is available for persona delivery
 		if binding.WebhookID == "" || binding.WebhookToken == "" {
 			if newWH, err := EnsureWebhook(s, m.ChannelID); err == nil && newWH != nil {
@@ -352,7 +352,7 @@ func (b *Bot) runBridgedTurn(s *discordgo.Session, m *discordgo.MessageCreate, b
 
 	var assistantText strings.Builder
 
-	streamErr := b.withTyping(s, m.ChannelID, func() error {
+	streamErr := b.withTyping(s, binding.AgentID, m.ChannelID, func() error {
 		ctx := context.Background()
 
 		turnStream, err := b.activeClient().AddAndGenerateTurnStream(ctx, &agentv1.AddAndGenerateTurnStreamRequest{
@@ -432,8 +432,14 @@ func (b *Bot) runBridgedTurn(s *discordgo.Session, m *discordgo.MessageCreate, b
 }
 
 // withTyping runs fn while a background goroutine keeps the Discord typing indicator
-// alive on channelID, stopping the indicator once fn returns.
-func (b *Bot) withTyping(s *discordgo.Session, channelID string, fn func() error) error {
+// alive on channelID, stopping the indicator once fn returns. Only routed
+// (bridged/SDK-direct) agents use the wrapper: native agents hold session.lock for the
+// whole turn, and the lock-typing watcher asserts the indicator for every turn origin,
+// so running it here too would double-assert.
+func (b *Bot) withTyping(s *discordgo.Session, agentID, channelID string, fn func() error) error {
+	if !b.isBridged(agentID) {
+		return fn()
+	}
 	stopTyping := make(chan struct{})
 	if s != nil {
 		go func() {
