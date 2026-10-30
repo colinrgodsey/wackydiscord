@@ -358,6 +358,7 @@ func (b *Bot) handleBindCommand(s *discordgo.Session, i *discordgo.InteractionCr
 
 	if !b.isBridged(agentID) {
 		b.feed.watch(agentID)
+		b.lockTyping.watch(agentID)
 	}
 
 	b.respondInteraction(s, i, bindAckMessage(agentID, modelName), false)
@@ -399,6 +400,7 @@ func (b *Bot) handleUnbindCommand(s *discordgo.Session, i *discordgo.Interaction
 	}
 
 	b.feed.unwatch(agentID)
+	b.lockTyping.unwatch(agentID)
 
 	b.respondInteraction(s, i, fmt.Sprintf("🔓 Channel unbound from agent **%s**.", agentID), false)
 }

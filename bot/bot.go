@@ -6,6 +6,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -27,12 +29,21 @@ type Bot struct {
 	Client AgentClient
 	// server is the stdio backend backing Client. nil when Client was injected, which
 	// is how the tests drive the bot without a binary.
-	server  *SpawnedServer
-	feed    *sessionFeed
-	State   *State
-	WsDir   string
-	GuildID string
-	AppID   string
+	server *SpawnedServer
+	// lockTyping drives the typing indicator for wackypub-native bound agents from
+	// their session.lock files (see lock_typing.go); nil in test-constructed literals.
+	lockTyping *lockTyping
+	feed       *sessionFeed
+	State      *State
+	WsDir      string
+	GuildID    string
+	AppID      string
+
+	// lastTyping records when refreshChannelTyping last asserted a channel's typing
+	// indicator, so a mid-turn agent refreshes at the established cadence, not once
+	// per lock event. Lazily initialized; test-constructed Bot literals rely on it.
+	lastTyping map[string]time.Time
+	typingMu   sync.Mutex
 }
 
 // NewBot initializes a new Bot instance with the provided configuration.
@@ -106,6 +117,7 @@ func NewBot(cfg Config) (*Bot, error) {
 		GuildID: cfg.GuildID,
 	}
 	b.feed = newSessionFeed(b)
+	b.lockTyping = newLockTyping(b)
 
 	if err := awaitAgentService(context.Background(), server, absWsDir, agentReadinessTimeout, agentReadinessPollEvery); err != nil {
 		warnIfServiceUnreachable(err, absWsDir)
@@ -216,6 +228,7 @@ func (b *Bot) startFeed(ctx context.Context) {
 	}
 	b.feed.start(ctx)
 	b.watchExistingBindings()
+	b.lockTyping.start(ctx)
 }
 
 // watchExistingBindings subscribes the session feed to every persisted binding at
