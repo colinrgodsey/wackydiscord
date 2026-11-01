@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,16 @@ import (
 // bind-time InspectAgent bridge spawn the same command already performs;
 // the timeout exists so a wedged harness cannot hang the bind indefinitely.
 const modelCLITimeout = 30 * time.Second
+
+// modelGetCommand builds the bridge model-CLI child. The env is explicit:
+// Env=nil would inherit the bot's full environment, which carries
+// DISCORD_BOT_TOKEN - the bridge and its children must not see it.
+func modelGetCommand(ctx context.Context, bridge, dir string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, bridge, "model", "get")
+	cmd.Dir = dir
+	cmd.Env = envWithout(os.Environ(), EnvDiscordBotToken)
+	return cmd
+}
 
 // bridgedModelGet resolves the harness-confirmed model of a bridged agent
 // through the model CLI (tasks/wackyacp/model-cli consumer path, replaces
@@ -43,8 +54,7 @@ func (b *Bot) bridgedModelGet(agentID string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), modelCLITimeout)
 	defer cancel()
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, fields[0], "model", "get")
-	cmd.Dir = agentFolder
+	cmd := modelGetCommand(ctx, fields[0], agentFolder)
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {

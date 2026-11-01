@@ -12,11 +12,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const (
-	// EnvDiscordBotToken is the standard environment variable name for the Discord bot token.
-	EnvDiscordBotToken = "DISCORD_BOT_TOKEN"
-)
-
 var (
 	flagWs            string
 	flagStateFile     string
@@ -76,7 +71,7 @@ func init() {
 	// --token stays registered after removal so that a stale launch config fails with the
 	// migration instruction instead of cobra's bare "unknown flag". It is hidden, and nothing
 	// reads its value.
-	rootCmd.Flags().String("token", "", "removed: set "+EnvDiscordBotToken+" instead")
+	rootCmd.Flags().String("token", "", "removed: set "+bot.EnvDiscordBotToken+" instead")
 	_ = rootCmd.Flags().MarkHidden("token")
 	rootCmd.Flags().StringVar(&flagStateFile, "state-file", "", "Custom state file path (default: <ws_dir>/.wackydiscord.json)")
 	rootCmd.Flags().StringVar(&flagWackypubBin, "wackypub-bin", bot.DefaultWackypubBin, "Path to the wackypub binary spawned to serve the agent protocol")
@@ -92,11 +87,11 @@ func init() {
 // /proc/<pid>/environ, where this reads from, is owner-only.
 func resolveToken(cmd *cobra.Command, getenv func(string) string) (string, error) {
 	if cmd.Flags().Changed("token") {
-		return "", fmt.Errorf("--token was removed because argv is world-readable in ps: set the %s environment variable instead (for systemd, EnvironmentFile= pointing at a mode-0600 file, not Environment=, which is readable via systemctl show)", EnvDiscordBotToken)
+		return "", fmt.Errorf("--token was removed because argv is world-readable in ps: set the %s environment variable instead (for systemd, EnvironmentFile= pointing at a mode-0600 file, not Environment=, which is readable via systemctl show)", bot.EnvDiscordBotToken)
 	}
-	token := strings.TrimSpace(getenv(EnvDiscordBotToken))
+	token := strings.TrimSpace(getenv(bot.EnvDiscordBotToken))
 	if token == "" {
-		return "", fmt.Errorf("discord bot token is required: set the %s environment variable", EnvDiscordBotToken)
+		return "", fmt.Errorf("discord bot token is required: set the %s environment variable", bot.EnvDiscordBotToken)
 	}
 	return token, nil
 }
