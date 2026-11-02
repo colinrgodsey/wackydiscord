@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+
+	"github.com/colinrgodsey/wackydiscord/bot"
 )
 
 func tokenFlagCommand() *cobra.Command {
@@ -39,7 +41,7 @@ func TestResolveTokenRefusesArgv(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected --token to be refused")
 	}
-	if !strings.Contains(err.Error(), EnvDiscordBotToken) {
+	if !strings.Contains(err.Error(), bot.EnvDiscordBotToken) {
 		t.Errorf("the refusal must name the replacement, got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "ps") {
@@ -52,7 +54,7 @@ func TestResolveTokenRequiresEnvironment(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error when no token is configured")
 	}
-	if !strings.Contains(err.Error(), EnvDiscordBotToken) {
+	if !strings.Contains(err.Error(), bot.EnvDiscordBotToken) {
 		t.Errorf("the error must name the variable to set, got: %v", err)
 	}
 	// Never echo a token-like value in an error: these strings reach logs and stderr.
@@ -77,8 +79,8 @@ func TestTokenFlagIsHiddenTombstone(t *testing.T) {
 }
 
 func TestEnvVariableNameIsStable(t *testing.T) {
-	if EnvDiscordBotToken != "DISCORD_BOT_TOKEN" {
-		t.Errorf("renaming the environment variable breaks every existing launcher; %q", EnvDiscordBotToken)
+	if bot.EnvDiscordBotToken != "DISCORD_BOT_TOKEN" {
+		t.Errorf("renaming the environment variable breaks every existing launcher; %q", bot.EnvDiscordBotToken)
 	}
 }
 

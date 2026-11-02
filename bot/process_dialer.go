@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -60,6 +61,16 @@ func NewProcessDialer(lifecycle context.Context, bin, wsDir string) *ProcessDial
 	return &ProcessDialer{bin: bin, wsDir: wsDir, lifecycle: lifecycle}
 }
 
+// stdioServeCommand builds the stdio-serve child. The env is explicit: Env=nil
+// would inherit the bot's full environment, which carries DISCORD_BOT_TOKEN -
+// the child and its tool subprocesses must not see it.
+func (d *ProcessDialer) stdioServeCommand() *exec.Cmd {
+	cmd := exec.Command(d.bin, "stdio-serve")
+	cmd.Dir = d.wsDir
+	cmd.Env = envWithout(os.Environ(), EnvDiscordBotToken)
+	return cmd
+}
+
 // Dial implements the grpc.WithContextDialer contract. It is serialized:
 // pick_first dials one subchannel at a time, but the resolver-reset path can
 // re-enter, and two concurrent children would leave one holding a live stdin
@@ -85,8 +96,7 @@ func (d *ProcessDialer) Dial(ctx context.Context, target string) (net.Conn, erro
 		d.ours = killReplaced
 	}
 
-	cmd := exec.Command(d.bin, "stdio-serve")
-	cmd.Dir = d.wsDir
+	cmd := d.stdioServeCommand()
 	conn, err := stdio.DialCommand(ctx, cmd, reapGrace)
 	if err != nil {
 		d.lastCmd = cmd
