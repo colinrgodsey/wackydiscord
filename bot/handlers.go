@@ -52,7 +52,15 @@ func (b *Bot) HandleMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 		return
 	}
 
-	b.runTurn(s, m, binding, userText)
+	// Enqueue instead of running the turn synchronously: the per-channel
+	// worker drains the queue (coalescing everything currently queued into
+	// one turn) off the Discord event loop.
+	b.queueForChannel(m.ChannelID).enqueue(&turnItem{
+		s:        s,
+		userText: userText,
+		message:  m,
+		agentID:  binding.AgentID,
+	})
 }
 
 // resolveMessageContext re-reads the channel binding under the already-held turn lock
@@ -123,10 +131,11 @@ func (b *Bot) prepareUserText(s *discordgo.Session, m *discordgo.MessageCreate, 
 // runTurn dispatches userText as a new agent turn, streams the response back to the
 // channel (via withTyping to keep the typing indicator alive), and posts a stop/error
 // notice when the turn didn't complete cleanly. It owns the IsGenerating bookkeeping
-// across dispatch and streaming.
-func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding *ChannelBinding, userText string) {
+// across dispatch and streaming. It is invoked by the per-channel turn queue worker
+// (turnqueue.go), which may hand it a userText coalesced from several queued messages.
+func (b *Bot) runTurn(s *discordgo.Session, channelID string, binding *ChannelBinding, userText string) {
 	if b.isBridged(binding.AgentID) {
-		b.runBridgedTurn(s, m, binding, userText)
+		b.runBridgedTurn(s, channelID, binding, userText)
 		return
 	}
 
@@ -134,10 +143,10 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 	expectedHash := ComputeTurnHash(genai.NewContentFromText(userText, "user"))
 	var shouldProceed bool
 	func() {
-		syncUnlock := b.State.LockChannelSync(m.ChannelID)
+		syncUnlock := b.State.LockChannelSync(channelID)
 		defer syncUnlock()
 
-		bnd := b.State.GetBinding(m.ChannelID)
+		bnd := b.State.GetBinding(channelID)
 		if bnd == nil || bnd.AgentID != binding.AgentID {
 			return
 		}
@@ -145,7 +154,7 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 		bnd.IsGenerating = true
 		bnd.AddPendingUserHash(expectedHash)
 		if err := b.State.SetBinding(bnd); err != nil {
-			log.Printf("⚠️ failed to persist IsGenerating state in channel %s: %v", m.ChannelID, err)
+			log.Printf("⚠️ failed to persist IsGenerating state in channel %s: %v", channelID, err)
 		}
 		shouldProceed = true
 	}()
@@ -155,18 +164,18 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 	}
 
 	defer func() {
-		syncUnlock := b.State.LockChannelSync(m.ChannelID)
+		syncUnlock := b.State.LockChannelSync(channelID)
 		defer syncUnlock()
 
-		bnd := b.State.GetBinding(m.ChannelID)
+		bnd := b.State.GetBinding(channelID)
 		if bnd != nil && bnd.IsGenerating {
 			if bnd.AgentID != binding.AgentID {
-				log.Printf("⚠️ channel %s was rebound to agent %q during generation for %q; skipping deferred IsGenerating reset", m.ChannelID, bnd.AgentID, binding.AgentID)
+				log.Printf("⚠️ channel %s was rebound to agent %q during generation for %q; skipping deferred IsGenerating reset", channelID, bnd.AgentID, binding.AgentID)
 				return
 			}
 			bnd.IsGenerating = false
 			if err := b.State.SetBinding(bnd); err != nil {
-				log.Printf("⚠️ failed to reset IsGenerating in channel %s: %v", m.ChannelID, err)
+				log.Printf("⚠️ failed to reset IsGenerating in channel %s: %v", channelID, err)
 			}
 		}
 	}()
@@ -179,7 +188,7 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 		WorkspaceDir: b.WsDir,
 	})
 	if addErr != nil {
-		b.say(s, m.ChannelID, "System", fmt.Sprintf("❌ **Turn error:** %v", addErr), nil)
+		b.say(s, channelID, "System", fmt.Sprintf("❌ **Turn error:** %v", addErr), nil)
 		return
 	}
 
@@ -188,10 +197,10 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 	}
 
 	func() {
-		syncUnlock := b.State.LockChannelSync(m.ChannelID)
+		syncUnlock := b.State.LockChannelSync(channelID)
 		defer syncUnlock()
 
-		freshBnd := b.State.GetBinding(m.ChannelID)
+		freshBnd := b.State.GetBinding(channelID)
 		if freshBnd != nil && freshBnd.AgentID == binding.AgentID {
 			actualHash := ComputeTurnHash(SessionTurnToContent(res.GetTurn()))
 			if actualHash != expectedHash {
@@ -199,7 +208,7 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 			}
 			freshBnd.IsGenerating = true
 			if err := b.State.SetBinding(freshBnd); err != nil {
-				log.Printf("⚠️ failed to persist IsGenerating state in channel %s: %v", m.ChannelID, err)
+				log.Printf("⚠️ failed to persist IsGenerating state in channel %s: %v", channelID, err)
 			}
 		}
 	}()
@@ -208,14 +217,14 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 		log.Printf("⚠️ hook warning for agent %s: %s", binding.AgentID, w)
 	}
 
-	streamErr := b.withTyping(s, binding.AgentID, m.ChannelID, func() error {
+	streamErr := b.withTyping(s, binding.AgentID, channelID, func() error {
 		// 4. Ensure Webhook is available for persona delivery
 		if binding.WebhookID == "" || binding.WebhookToken == "" {
-			if newWH, err := EnsureWebhook(s, m.ChannelID); err == nil && newWH != nil {
+			if newWH, err := EnsureWebhook(s, channelID); err == nil && newWH != nil {
 				func() {
-					syncUnlock := b.State.LockChannelSync(m.ChannelID)
+					syncUnlock := b.State.LockChannelSync(channelID)
 					defer syncUnlock()
-					if bnd := b.State.GetBinding(m.ChannelID); bnd != nil && bnd.AgentID == binding.AgentID {
+					if bnd := b.State.GetBinding(channelID); bnd != nil && bnd.AgentID == binding.AgentID {
 						bnd.WebhookID = newWH.ID
 						bnd.WebhookToken = newWH.Token
 						// Best-effort cache of the resolved webhook: in-memory state is what
@@ -241,13 +250,13 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 		// D112 tool-call visibility: live tool activity is rendered straight off the
 		// stream. Message text stays with the session feed and turn backfill, so the two renderers never
 		// write the same content. Gated on /verbose like the backfilled tool detail.
-		liveBnd := b.State.GetBinding(m.ChannelID)
+		liveBnd := b.State.GetBinding(channelID)
 		if liveBnd == nil {
 			liveBnd = binding
 		}
 		var toolActivity *ToolActivity
 		if liveBnd.Verbose {
-			toolActivity = NewToolActivity(newChannelPoster(s, m.ChannelID, liveBnd))
+			toolActivity = NewToolActivity(newChannelPoster(s, channelID, liveBnd))
 			defer toolActivity.Finish()
 		}
 		for {
@@ -263,12 +272,12 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 	})
 
 	func() {
-		syncUnlock := b.State.LockChannelSync(m.ChannelID)
+		syncUnlock := b.State.LockChannelSync(channelID)
 		defer syncUnlock()
-		if bnd := b.State.GetBinding(m.ChannelID); bnd != nil && bnd.AgentID == binding.AgentID {
+		if bnd := b.State.GetBinding(channelID); bnd != nil && bnd.AgentID == binding.AgentID {
 			bnd.IsGenerating = false
 			if err := b.State.SetBinding(bnd); err != nil {
-				log.Printf("⚠️ failed to reset IsGenerating in channel %s: %v", m.ChannelID, err)
+				log.Printf("⚠️ failed to reset IsGenerating in channel %s: %v", channelID, err)
 			}
 		}
 	}()
@@ -279,15 +288,15 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 
 	if streamErr != nil {
 		if errors.Is(streamErr, context.Canceled) || strings.Contains(streamErr.Error(), "context canceled") {
-			b.say(s, m.ChannelID, "System", "⏹️ Turn stopped.", nil)
+			b.say(s, channelID, "System", "⏹️ Turn stopped.", nil)
 			return
 		}
 		if text, ok := b.describeServiceError(streamErr); ok {
-			log.Printf("⚠️ turn in channel %s lost the agent service mid-call: %v", m.ChannelID, streamErr)
-			b.say(s, m.ChannelID, "System", text, nil)
+			log.Printf("⚠️ turn in channel %s lost the agent service mid-call: %v", channelID, streamErr)
+			b.say(s, channelID, "System", text, nil)
 			return
 		}
-		b.say(s, m.ChannelID, "System", fmt.Sprintf("❌ **Agent error:** %v", streamErr), nil)
+		b.say(s, channelID, "System", fmt.Sprintf("❌ **Agent error:** %v", streamErr), nil)
 		return
 	}
 }
@@ -295,20 +304,20 @@ func (b *Bot) runTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding 
 // runBridgedTurn executes a turn for a remote bridged agent using AddAndGenerateTurnStream.
 // It streams live tool activity, accumulates the final assistant text, and delivers it
 // via persona webhook or bot message without relying on local session.jsonl.
-func (b *Bot) runBridgedTurn(s *discordgo.Session, m *discordgo.MessageCreate, binding *ChannelBinding, userText string) {
+func (b *Bot) runBridgedTurn(s *discordgo.Session, channelID string, binding *ChannelBinding, userText string) {
 	var shouldProceed bool
 	func() {
-		syncUnlock := b.State.LockChannelSync(m.ChannelID)
+		syncUnlock := b.State.LockChannelSync(channelID)
 		defer syncUnlock()
 
-		bnd := b.State.GetBinding(m.ChannelID)
+		bnd := b.State.GetBinding(channelID)
 		if bnd == nil || bnd.AgentID != binding.AgentID {
 			return
 		}
 
 		bnd.IsGenerating = true
 		if err := b.State.SetBinding(bnd); err != nil {
-			log.Printf("⚠️ failed to persist IsGenerating state in channel %s: %v", m.ChannelID, err)
+			log.Printf("⚠️ failed to persist IsGenerating state in channel %s: %v", channelID, err)
 		}
 		shouldProceed = true
 	}()
@@ -318,18 +327,18 @@ func (b *Bot) runBridgedTurn(s *discordgo.Session, m *discordgo.MessageCreate, b
 	}
 
 	defer func() {
-		syncUnlock := b.State.LockChannelSync(m.ChannelID)
+		syncUnlock := b.State.LockChannelSync(channelID)
 		defer syncUnlock()
 
-		bnd := b.State.GetBinding(m.ChannelID)
+		bnd := b.State.GetBinding(channelID)
 		if bnd != nil && bnd.IsGenerating {
 			if bnd.AgentID != binding.AgentID {
-				log.Printf("⚠️ channel %s was rebound to agent %q during generation for %q; skipping deferred IsGenerating reset", m.ChannelID, bnd.AgentID, binding.AgentID)
+				log.Printf("⚠️ channel %s was rebound to agent %q during generation for %q; skipping deferred IsGenerating reset", channelID, bnd.AgentID, binding.AgentID)
 				return
 			}
 			bnd.IsGenerating = false
 			if err := b.State.SetBinding(bnd); err != nil {
-				log.Printf("⚠️ failed to reset IsGenerating in channel %s: %v", m.ChannelID, err)
+				log.Printf("⚠️ failed to reset IsGenerating in channel %s: %v", channelID, err)
 			}
 		}
 	}()
@@ -337,12 +346,12 @@ func (b *Bot) runBridgedTurn(s *discordgo.Session, m *discordgo.MessageCreate, b
 	var wh *discordgo.Webhook
 	if binding.WebhookID != "" && binding.WebhookToken != "" {
 		wh = &discordgo.Webhook{ID: binding.WebhookID, Token: binding.WebhookToken}
-	} else if newWH, err := EnsureWebhook(s, m.ChannelID); err == nil && newWH != nil {
+	} else if newWH, err := EnsureWebhook(s, channelID); err == nil && newWH != nil {
 		wh = newWH
 		func() {
-			syncUnlock := b.State.LockChannelSync(m.ChannelID)
+			syncUnlock := b.State.LockChannelSync(channelID)
 			defer syncUnlock()
-			if bnd := b.State.GetBinding(m.ChannelID); bnd != nil && bnd.AgentID == binding.AgentID {
+			if bnd := b.State.GetBinding(channelID); bnd != nil && bnd.AgentID == binding.AgentID {
 				bnd.WebhookID = newWH.ID
 				bnd.WebhookToken = newWH.Token
 				_ = b.State.SetBinding(bnd)
@@ -352,7 +361,7 @@ func (b *Bot) runBridgedTurn(s *discordgo.Session, m *discordgo.MessageCreate, b
 
 	var assistantText strings.Builder
 
-	streamErr := b.withTyping(s, binding.AgentID, m.ChannelID, func() error {
+	streamErr := b.withTyping(s, binding.AgentID, channelID, func() error {
 		ctx := context.Background()
 
 		turnStream, err := b.activeClient().AddAndGenerateTurnStream(ctx, &agentv1.AddAndGenerateTurnStreamRequest{
@@ -364,13 +373,13 @@ func (b *Bot) runBridgedTurn(s *discordgo.Session, m *discordgo.MessageCreate, b
 			return err
 		}
 
-		liveBnd := b.State.GetBinding(m.ChannelID)
+		liveBnd := b.State.GetBinding(channelID)
 		if liveBnd == nil {
 			liveBnd = binding
 		}
 		var toolActivity *ToolActivity
 		if liveBnd.Verbose {
-			toolActivity = NewToolActivity(newChannelPoster(s, m.ChannelID, liveBnd))
+			toolActivity = NewToolActivity(newChannelPoster(s, channelID, liveBnd))
 			defer toolActivity.Finish()
 		}
 
@@ -396,19 +405,19 @@ func (b *Bot) runBridgedTurn(s *discordgo.Session, m *discordgo.MessageCreate, b
 	})
 
 	func() {
-		syncUnlock := b.State.LockChannelSync(m.ChannelID)
+		syncUnlock := b.State.LockChannelSync(channelID)
 		defer syncUnlock()
-		if bnd := b.State.GetBinding(m.ChannelID); bnd != nil && bnd.AgentID == binding.AgentID {
+		if bnd := b.State.GetBinding(channelID); bnd != nil && bnd.AgentID == binding.AgentID {
 			bnd.IsGenerating = false
 			if err := b.State.SetBinding(bnd); err != nil {
-				log.Printf("⚠️ failed to reset IsGenerating in channel %s: %v", m.ChannelID, err)
+				log.Printf("⚠️ failed to reset IsGenerating in channel %s: %v", channelID, err)
 			}
 		}
 	}()
 
 	if streamErr != nil {
 		if errors.Is(streamErr, context.Canceled) || strings.Contains(streamErr.Error(), "context canceled") {
-			b.say(s, m.ChannelID, "System", "⏹️ Turn stopped.", nil)
+			b.say(s, channelID, "System", "⏹️ Turn stopped.", nil)
 			return
 		}
 		var statusErr interface {
@@ -416,18 +425,18 @@ func (b *Bot) runBridgedTurn(s *discordgo.Session, m *discordgo.MessageCreate, b
 		}
 		if errors.As(streamErr, &statusErr) {
 			if st := statusErr.GRPCStatus(); st != nil && st.Code() == codes.ResourceExhausted {
-				b.say(s, m.ChannelID, "System", fmt.Sprintf("⏳ **%s is busy:** Another turn is currently in flight. Please wait for it to complete.", binding.AgentID), nil)
+				b.say(s, channelID, "System", fmt.Sprintf("⏳ **%s is busy:** Another turn is currently in flight. Please wait for it to complete.", binding.AgentID), nil)
 				return
 			}
 		}
-		b.say(s, m.ChannelID, "System", fmt.Sprintf("❌ **Bridge error (%s):** %v", binding.AgentID, streamErr), nil)
+		b.say(s, channelID, "System", fmt.Sprintf("❌ **Bridge error (%s):** %v", binding.AgentID, streamErr), nil)
 		return
 	}
 
 	reply := strings.TrimSpace(assistantText.String())
 	if reply != "" {
 		reply = ExpandScratchpadSentinels(b.activeClient(), binding.AgentID, b.WsDir, reply)
-		b.say(s, m.ChannelID, binding.AgentID, reply, wh)
+		b.say(s, channelID, binding.AgentID, reply, wh)
 	}
 }
 

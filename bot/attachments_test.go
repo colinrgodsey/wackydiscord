@@ -625,6 +625,7 @@ func TestHandleMessageCreate_WithAttachments(t *testing.T) {
 	}
 
 	b.HandleMessageCreate(s, msg)
+	waitQueueIdle(t, b, "chan_att_test")
 
 	// Verify the inlined file was passed in the user prompt
 	if !strings.Contains(capturedUserPrompt, "[Attached file: config.yaml]") {

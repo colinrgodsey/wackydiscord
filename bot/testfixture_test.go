@@ -163,6 +163,7 @@ type fakeAgent struct {
 	inspectErrs      []error
 	listErrs         []error
 	addAndGenStreams []func(*agentv1.AddAndGenerateTurnStreamResponse)
+	addAndGenCalls   int
 	addAndGenErr     error
 	streams          []func(*agentv1.GenerateTurnStreamResponse)
 	subEvents        chan *agentv1.SubscribeSessionResponse
@@ -720,6 +721,7 @@ func (f *fakeAgent) AddAndGenerateTurnStream(ctx context.Context, in *agentv1.Ad
 		return nil, err
 	}
 	f.inFlight = true
+	f.addAndGenCalls++
 	started := f.started
 	hold := f.hold
 	streamCtx, cancel := context.WithCancel(ctx)

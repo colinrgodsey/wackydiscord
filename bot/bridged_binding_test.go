@@ -275,6 +275,7 @@ func TestBridgedTurn_StreamedResponse(t *testing.T) {
 	sdk.mu.Unlock()
 
 	b.HandleMessageCreate(b.Session, makeMessage("ping"))
+	waitQueueIdle(t, b, "chan_bridged")
 
 	output := spy.allOutput()
 	if !strings.Contains(output, "Hello world from agy!") {
@@ -321,6 +322,7 @@ func TestBridgedTurn_ToolActivityVerbose(t *testing.T) {
 	sdk.mu.Unlock()
 
 	b.HandleMessageCreate(b.Session, makeMessage("run tool"))
+	waitQueueIdle(t, b, "chan_bridged")
 
 	output := spy.allOutput()
 	if !strings.Contains(output, "Done executing.") {
@@ -338,6 +340,7 @@ func TestBridgedTurn_BusyRejection(t *testing.T) {
 	sdk.mu.Unlock()
 
 	b.HandleMessageCreate(b.Session, makeMessage("hello"))
+	waitQueueIdle(t, b, "chan_bridged")
 
 	output := spy.allOutput()
 	if !strings.Contains(output, "agy is busy") || !strings.Contains(output, "Another turn is currently in flight") {
@@ -360,6 +363,7 @@ func TestBridgedTurn_BridgeError(t *testing.T) {
 	sdk.mu.Unlock()
 
 	b.HandleMessageCreate(b.Session, makeMessage("crash"))
+	waitQueueIdle(t, b, "chan_bridged")
 
 	output := spy.allOutput()
 	if !strings.Contains(output, "Bridge error (agy)") || !strings.Contains(output, "137") {
@@ -380,9 +384,7 @@ func TestBridgedTurn_StopCommand(t *testing.T) {
 	sdk.hold = make(chan struct{})
 	sdk.started = make(chan struct{})
 
-	turnDone := make(chan struct{})
 	go func() {
-		defer close(turnDone)
 		b.HandleMessageCreate(b.Session, makeMessage("start long task"))
 	}()
 
@@ -401,11 +403,7 @@ func TestBridgedTurn_StopCommand(t *testing.T) {
 	iStop := makeInteraction("stop", nil)
 	b.handleStopCommand(b.Session, iStop)
 
-	select {
-	case <-turnDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for turn to finish after stop")
-	}
+	waitQueueIdle(t, b, "chan_bridged")
 
 	output := spy.allOutput()
 	if !strings.Contains(output, "Turn stopped") && !strings.Contains(output, "Turn cancelled") {
@@ -542,6 +540,7 @@ func TestBridged_NameCollision_RemoteManifestWins(t *testing.T) {
 	sdk.mu.Unlock()
 
 	b.HandleMessageCreate(b.Session, makeMessage("ping"))
+	waitQueueIdle(t, b, "chan_bridged")
 
 	output := spy.allOutput()
 	if !strings.Contains(output, "Bridged answer") {
