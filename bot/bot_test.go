@@ -1382,7 +1382,6 @@ func TestHandleMessageCreate_TurnStoppedOnCancel(t *testing.T) {
 		Client: sdk,
 	}
 
-	done := make(chan struct{})
 	go func() {
 		b.HandleMessageCreate(s, &discordgo.MessageCreate{
 			Message: &discordgo.Message{
@@ -1392,7 +1391,6 @@ func TestHandleMessageCreate_TurnStoppedOnCancel(t *testing.T) {
 				Author:    &discordgo.User{ID: "u1", Bot: false},
 			},
 		})
-		close(done)
 	}()
 
 	select {
@@ -1406,11 +1404,7 @@ func TestHandleMessageCreate_TurnStoppedOnCancel(t *testing.T) {
 		t.Fatalf("CancelTurn failed: %v", err)
 	}
 
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for HandleMessageCreate to finish after cancel")
-	}
+	waitQueueIdle(t, b, "chan_stop_msg")
 
 	mu.Lock()
 	msgs := append([]string{}, sentMessages...)
@@ -1612,6 +1606,7 @@ func TestLiveTurn_ExpandsScratchpadSentinelBeforePost(t *testing.T) {
 	sdk.mu.Unlock()
 
 	b.HandleMessageCreate(b.Session, makeMessage("tell the story"))
+	waitQueueIdle(t, b, "chan_bridged")
 
 	output := spy.allOutput()
 	if strings.Contains(output, "<SCRATCHPAD_EXPAND") {

@@ -44,6 +44,12 @@ type Bot struct {
 	// per lock event. Lazily initialized; test-constructed Bot literals rely on it.
 	lastTyping map[string]time.Time
 	typingMu   sync.Mutex
+
+	// turnQueues holds the per-channel message coalescing queues (see
+	// turnqueue.go). Lazily initialized; test-constructed Bot literals rely on
+	// it.
+	turnQueues   map[string]*turnQueue
+	turnQueuesMu sync.Mutex
 }
 
 // NewBot initializes a new Bot instance with the provided configuration.
